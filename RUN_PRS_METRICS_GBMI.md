@@ -29,6 +29,7 @@ The pipeline uses three PRS:
   - [4.2 Progression phenotype file](#section-4-2)
   - [4.3 Covariate file](#section-4-3)
   - [4.4 Recruitment-age file](#section-4-4)
+  - [4.5 Population keep-list (optional)](#section-4-5)
 - [5. Set variables](#section-5)
 - [6. Run the pipeline](#section-6)
   - [6.1 Layer 1: GWAS-aligned analysis](#section-6-1)
@@ -179,6 +180,8 @@ Repeat the smoke test after updating the pipeline, R, or major package versions.
 
 ## 4.1 Three PRS files
 
+The weights for per-biobank using LOBO multi-ancestry meta GWAS will be distributed to each biobank analyst.
+
 All three PRS files are required:
 
 | PRS | Description |
@@ -194,13 +197,22 @@ Each file must contain:
 
 Individuals missing any one of the three scores are excluded from all models.
 
-**Use unrelated individuals for PRS calculation.**
+
+
+<span style="color:red;">**Note: Use unrelated individuals for PRS calculation.**</span>
+
+The **survival models likewise assume independent observations**, so the analysis should also be run
+on unrelated individuals — see [4.5 Population keep-list](#section-4-5) for the optional `--pop-file`
+that enforces this (and/or restricts to one target ancestry).
 
 For PRS calculation and chromosome merging, see:
 
 - https://github.com/globalbiobankmeta/PRS
 - https://github.com/globalbiobankmeta/PRS/blob/main/run_prscs_auto_pipe.md
 
+<span style="color:red;">
+<strong>Note:</strong> To ensure compatibility with the pipeline, please use the following naming conventions for PRS outputs: <code>T1</code> for onset PRS, <code>T1toT2</code> or <code>T1_to_T2</code> for progression PRS, and <code>T2</code> for outcome PRS. Please refer to the <a href="https://github.com/globalbiobankmeta/Longitudinal-PRS/blob/main/gbmi_trajectory_biobank_gwas_names.tsv">trajectory definition file</a> for the complete trajectory definitions for each biobank.
+</span>
 
 <a id="section-4-2"></a>
 
@@ -217,7 +229,7 @@ Required columns for the recommended age-derived analysis:
 | `diagAge` | Age at T1 |
 | `ageExit` | Age at T2 for events, or age at censoring for non-events |
 | `sex` | Binary numeric variable coded 0/1 |
-| `PC1`–`PC10` | Genetic principal components |
+| `PC1`-`PC10` | Genetic principal components |
 | `birthyear` | Birth year |
 
 The recommended approach calculates:
@@ -302,6 +314,36 @@ IID    age_at_recruitment
 
 ---
 
+<a id="section-4-5"></a>
+
+## 4.5 Population keep-list (optional)
+
+An **optional** input file that restricts the analysis to a chosen set of individuals. Leave it unset
+(`POP_FILE=""`) to use the whole phenotype file — most sites, who already supply a per-ancestry,
+unrelated phenotype, do **not** need it.
+
+Use it when your phenotype file still contains individuals you want to drop, most commonly to keep only:
+
+- **unrelated individuals** — the survival models assume independent observations (the same reason
+  unrelated individuals are required for PRS calculation); and/or
+- a single **target ancestry**, when you run from a shared multi-ancestry input.
+
+Format: a **headerless PLINK keep-list** with two whitespace-separated columns, `FID IID`; matching is
+on the second column (IID). Example:
+
+```text
+1001   1001
+1002   1002
+1005   1005
+```
+
+It is an **IID subset only** — it does not change your covariates or scores, so you are still
+responsible for supplying ancestry-appropriate covariates/PCs and PRS. Pass it with `--pop-file`
+(variable `POP_FILE` in Section 5); it is applied in stage 01 before every downstream stage, so both
+Layer 1 (including the lag re-fits) and Layer 2 (prospective re-indexing) run on the restricted sample.
+
+---
+
 <a id="section-5"></a>
 
 # 5. Set variables
@@ -315,51 +357,67 @@ set -euo pipefail
 # ------------------------------------------------------------------
 # Trajectory, cohort, ancestry and PRS method
 # ------------------------------------------------------------------
-TRAIT="T1D_to_CAD"      #edit based on your biobank progression phenotype name
+TRAIT="T1D_to_CAD"      #Update based on your biobank progression phenotype name
 COHORT="MYBIOBANK"      #e.g, UKBB
-ANCESTRY="EUR"
+ANCESTRY="EUR"          # Target ancestry
 
 PRS_METHOD="PRScs"      #PRScs or PT
 DISCOVERY_ANCESTRY="MULTI"
-TARGET_ANCESTRY="$ANCESTRY"
 
 # ------------------------------------------------------------------
 # Pipeline and output locations
 # ------------------------------------------------------------------
-SCRIPT_DIR="/path/to/Longitudinal-PRS"  
+SCRIPT_DIR="/path/to/Longitudinal-PRS"  # where you downloaded the github repo
 
-OUT_ROOT="/path/to/results/${TRAIT}/${ANCESTRY}/${PRS_METHOD}"
-LAYER1_OUT_DIR="${OUT_ROOT}/gwas_aligned"
-LAYER2_OUT_DIR="${OUT_ROOT}/prospective"
+OUT_ROOT="/path/to/results/${TRAIT}/${ANCESTRY}/${PRS_METHOD}" #Update to reflect your output directory
+LAYER1_OUT_DIR="${OUT_ROOT}/gwas_aligned" #default
+LAYER2_OUT_DIR="${OUT_ROOT}/prospective" #default
 
 # ------------------------------------------------------------------
 # Input files
 # ------------------------------------------------------------------
-ONSET_PRS="/path/to/prs/T1D_score.sscore"
-PROG_PRS="/path/to/prs/${TRAIT}_score.sscore"
-OUTCOME_PRS="/path/to/prs/CAD_score.sscore"
 
-PHENO="/path/to/pheno/pheno.txt"
+# --- Derive onset (T1) and outcome (T2) names from TRAIT (split on 'to' / '_to_') ---
+# Assumes your PRS .sscore files use the standard trajectory naming. If your files use
+# other local names (e.g. AOU Birth_to_<T1>, FinnGen endpoint codes, phecodes), just edit
+# the three *_PRS paths below directly.
+
+read -r ONSET_NAME OUTCOME_NAME <<< "$(awk -v t="$TRAIT" \
+  'BEGIN{ s=(t ~ /_to_/) ? "_to_" : "to"; n=split(t,a,s); print a[1], a[n] }')"
+if [[ -z "$ONSET_NAME" || -z "$OUTCOME_NAME" || "$ONSET_NAME" == "$TRAIT" ]]; then
+  echo "ERROR: TRAIT must contain 'to' or '_to_' (e.g. T2DtoCAD or T2D_to_CAD)." >&2
+  exit 1
+fi
+
+ONSET_PRS="/path/to/prs/${ONSET_NAME}.sscore" ##note to update prefix or suffix for the onset PRS file (T0T1)
+PROG_PRS="/path/to/prs/${TRAIT}.sscore" ##note to update prefix or suffix for the progression PRS file (T1T2)
+OUTCOME_PRS="/path/to/prs/${OUTCOME_NAME}.sscore" ##note to update prefix or suffix for the outcome PRS file (T0T2)
+
+PHENO="/path/to/pheno/pheno.txt" # full path to your phenotype file
 
 # Leave empty when the covariates are stored in PHENO.
-COV_FILE=""
+COV_FILE="" # full path to your covariate file
 
 # Required for Layer 2 and recommended for Layer 1.
 # Leave empty only when Layer 1 will be run without recruitment-timing QC.
-RECRUIT="/path/to/recruit/recruit.txt"
+RECRUIT="/path/to/recruit/recruit.txt" #note to update as empty when there is no recruitement age file in your biobank
 
-# ------------------------------------------------------------------
-# Input column names
-# ------------------------------------------------------------------
+# Optional keep-list (headerless PLINK "FID IID"); restricts the run to these individuals —
+# unrelated set and/or one target ancestry. See section 4.5. Leave empty to use the whole input.
+POP_FILE="" 
+
+# ------------------------------------------------------------------------------
+# Input column names [update to reflect the names used in your biobank]
+# ------------------------------------------------------------------------------
 STATUS_COL="secondEvent"            #status of T2 (0/1)
 SEX_COL="sex"                     
 PRS_SCORE_COL="SCORE1_SUM"
-RECRUIT_AGE_COL="age_at_recruitment"
+RECRUIT_AGE_COL="age_at_recruitment" #note this is age note Date 
 
-COVARIATES="sex,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,birthyear".  #same as GWAS; don't include age at T1 here
+COVARIATES="sex,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,birthyear"  #same as GWAS; don't include age at T1 here
 
 # ------------------------------------------------------------------
-# Time definition: choose exactly one approach
+# Time definition: [choose exactly one approach]
 # ------------------------------------------------------------------
 AGE_T1_COL="diagAge" #age at T1
 
@@ -428,6 +486,11 @@ if [[ -n "$COV_FILE" ]]; then
   COV_FILE_ARGS=(--cov-file="$COV_FILE")
 fi
 
+POP_FILE_ARGS=()
+if [[ -n "$POP_FILE" ]]; then
+  POP_FILE_ARGS=(--pop-file="$POP_FILE")
+fi
+
 LAYER1_RECRUIT_ARGS=()
 if [[ -n "$RECRUIT" ]]; then
   LAYER1_RECRUIT_ARGS=(
@@ -466,6 +529,7 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" \
   --outcome-prs-file="$OUTCOME_PRS" \
   --pheno-file="$PHENO" \
   ${COV_FILE_ARGS[@]+"${COV_FILE_ARGS[@]}"} \
+  ${POP_FILE_ARGS[@]+"${POP_FILE_ARGS[@]}"} \
   --cohort="$COHORT" \
   --ancestry="$ANCESTRY" \
   --status-col="$STATUS_COL" \
@@ -477,7 +541,6 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" \
   --analysis-mode="$LAYER1_ANALYSIS_MODE" \
   --prs-method="$PRS_METHOD" \
   --discovery-ancestry="$DISCOVERY_ANCESTRY" \
-  --target-ancestry="$TARGET_ANCESTRY" \
   --time-points="$TIME_POINTS" \
   --lag-days="$LAYER1_LAG_DAYS" \
   --min-events-total="$MIN_EVENTS_TOTAL" \
@@ -516,6 +579,7 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" \
   --outcome-prs-file="$OUTCOME_PRS" \
   --pheno-file="$PHENO" \
   ${COV_FILE_ARGS[@]+"${COV_FILE_ARGS[@]}"} \
+  ${POP_FILE_ARGS[@]+"${POP_FILE_ARGS[@]}"} \
   --cohort="$COHORT" \
   --ancestry="$ANCESTRY" \
   --status-col="$STATUS_COL" \
@@ -530,7 +594,6 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" \
   --incident-lag-days="$INCIDENT_LAG_DAYS" \
   --prs-method="$PRS_METHOD" \
   --discovery-ancestry="$DISCOVERY_ANCESTRY" \
-  --target-ancestry="$TARGET_ANCESTRY" \
   --time-points="$TIME_POINTS" \
   --min-events-total="$MIN_EVENTS_TOTAL" \
   --min-cell-count="$MIN_CELL_COUNT" \

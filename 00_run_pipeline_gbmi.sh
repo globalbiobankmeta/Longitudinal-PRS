@@ -72,6 +72,8 @@ COVARIATES="${COVARIATES:-sex,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,birthyear
 ANALYSIS_MODE="${ANALYSIS_MODE:-gwas_aligned}"   # gwas_aligned (Layer 1) | prospective (Layer 2)
 RECRUIT_FILE="${RECRUIT_FILE:-}"                 # Layer 2 re-indexing; Layer 1 timing QC
 RECRUIT_AGE_COL="${RECRUIT_AGE_COL:-age_at_recruitment}"
+POP_FILE="${POP_FILE:-}"                         # optional keep-list (FID IID); restrict the run to these
+                                                 # IIDs (e.g. unrelated individuals, or one target ancestry)
 CALC_RMST="${CALC_RMST:-1}"                      # restricted mean progression-free time (stage 02)
 CALC_UNO="${CALC_UNO:-0}"                        # Uno's C in stage 01 (off; pooled Uno skipped in prospective)
 RMST_N_BOOT="${RMST_N_BOOT:-200}"                # bootstrap reps for RMST CIs/p (0 = no CIs)
@@ -187,6 +189,8 @@ Analysis layers:
   --analysis-mode=STR       gwas_aligned (Layer 1, default) | prospective (Layer 2)
   --recruit-file=FILE       prospective: IID + age at recruitment
   --recruit-age-col=NAME    (default: age_at_recruitment)
+  --pop-file=FILE           Optional keep-list (FID IID); restrict the analysis to these IIDs — e.g.
+                            unrelated individuals, or one target ancestry. Default: use the whole input.
   --incident-lag-days=NUM   prospective: lag added to the T1 index for incident T1 (default: 0)
   --lag-days=CSV            Layer 3 washout sweep; 0 = primary (default: 0,30,90,365)
   --min-events-total=INT    Hard floor on total T2 events (default: 50)
@@ -284,6 +288,8 @@ while (( $# )); do
     --recruit-file)      shift; RECRUIT_FILE="$1" ;;
     --recruit-age-col=*) RECRUIT_AGE_COL="${1#*=}" ;;
     --recruit-age-col)   shift; RECRUIT_AGE_COL="$1" ;;
+    --pop-file=*)        POP_FILE="${1#*=}" ;;
+    --pop-file)          shift; POP_FILE="$1" ;;
     --incident-lag-days=*) INCIDENT_LAG_DAYS="${1#*=}" ;;
     --incident-lag-days)   shift; INCIDENT_LAG_DAYS="$1" ;;
     --lag-days=*)        LAG_DAYS="${1#*=}" ;;
@@ -475,6 +481,11 @@ if [[ -n "$RECRUIT_FILE" && ! -f "$RECRUIT_FILE" ]]; then
   die "--recruit-file was given but does not exist: $RECRUIT_FILE"
 fi
 
+# A supplied --pop-file keep-list must exist (else the run would silently use the whole input).
+if [[ -n "$POP_FILE" && ! -f "$POP_FILE" ]]; then
+  die "--pop-file was given but does not exist: $POP_FILE"
+fi
+
 # Prospective mode needs a recruitment-age file — but only for stage 01, which
 # derives the prospective cohort. A downstream-only rerun (--run-01=0) works from
 # the RDS, which already holds the derived prospective variables.
@@ -584,6 +595,7 @@ if [[ "$RUN_01" == "1" ]]; then
   CKSUM_LINES+="phenotype=$(_sha "$PHENO_PATH")"$'\n'
   [[ -n "$COV_FILE" ]] && CKSUM_LINES+="covariate_file=$(_sha "$COV_FILE")"$'\n'
   [[ -n "$RECRUIT_FILE" ]] && CKSUM_LINES+="recruit_file=$(_sha "$RECRUIT_FILE")"$'\n'
+  [[ -n "$POP_FILE" ]] && CKSUM_LINES+="pop_file=$(_sha "$POP_FILE")"$'\n'
 fi
 PRS_MANIFEST="$MANIFEST_FILE" PRS_VERSION="$PIPELINE_VERSION" PRS_REQ_PKGS="$REQ_PKGS" \
   PRS_CKSUMS="$CKSUM_LINES" PRS_METHOD="$PRS_METHOD" \
@@ -797,6 +809,9 @@ MODE_ARGS=(--analysis_mode "$ANALYSIS_MODE" --min_events_total "$MIN_EVENTS_TOTA
            --min_cell_count "$MIN_CELL_COUNT")
 [[ "$CALC_UNO" == "1" ]] && MODE_ARGS+=(--calculate_uno)
 [[ -n "$CLINICAL_COVARIATES" ]] && MODE_ARGS+=(--clinical_covariates "$CLINICAL_COVARIATES")
+# Optional keep-list: stage 01 subsets the sample before every downstream stage, and MODE_ARGS is
+# passed to both the main fit and the lag re-fits, so the whole run honours the same keep-list.
+[[ -n "$POP_FILE" ]] && MODE_ARGS+=(--pop_file "$POP_FILE")
 # Forward the recruitment-age file whenever it is supplied, not only in prospective
 # mode: prospective needs it to re-index, but gwas_aligned uses it for the
 # descriptive recruitment-timing QC (prevalent / incident / historical counts).
@@ -839,6 +854,7 @@ if [[ "$RUN_01" == "1" ]]; then
   echo "calculate_uno,${CALC_UNO}"
   echo "stages,\"01=${RUN_01} 02=${RUN_02} 03=${RUN_03} 04=${RUN_04} 05=${RUN_05} 06=${RUN_06}\""
   echo "recruit_file_provided,$([[ -n "$RECRUIT_FILE" ]] && echo yes || echo no)"
+  echo "pop_file_provided,$([[ -n "$POP_FILE" ]] && echo yes || echo no)"
   # Additional resolved options, so the config captures every setting that shapes outputs.
   echo "age_spline_df,${AGE_SPLINE_DF}"
   echo "sex_col,${SEX_COL}"
