@@ -419,6 +419,8 @@ COVARIATES="sex,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,birthyear"  #same as GW
 # ------------------------------------------------------------------
 # Time definition: [choose exactly one approach]
 # ------------------------------------------------------------------
+AGE_SPLINE_DF="3"    #age at T1 enters as ns(diagAge, df=3); keep 3 (harmonized default). 0 = linear.
+
 AGE_T1_COL="diagAge" #age at T1
 
 # Recommended: derive time since T1 from ageExit - diagAge.
