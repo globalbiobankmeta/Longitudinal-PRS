@@ -19,21 +19,14 @@
 #   ONSET_to_OUTCOME   e.g. T1D_to_CAD, T2D_to_CAD
 #   ONSETtoOUTCOME     e.g. PARKINSONtoDEMENTIA, CADtoHEARTFAIL
 #
-# File layout assumed (all under BASE_PRS_DIR / BASE_PHENO_DIR):
-#   sscore : {BASE_PRS_DIR}/{ONSET}/{ONSET}_score.sscore
-#             {BASE_PRS_DIR}/{TRAIT}/{TRAIT}_score.sscore   <- progression
-#             {BASE_PRS_DIR}/{OUTCOME}/{OUTCOME}_score.sscore
-#   pheno  : {BASE_PHENO_DIR}/{TRAIT}/EUR_pheno_{TRAIT}.txt
+# Inputs are supplied explicitly (required): --onset/progression/outcome-prs-file,
+# --pheno-file and --out-dir.
 # ==============================================================================
 set -euo pipefail
 
-# ============================== Fixed GBMI paths ==============================
-BASE_PRS_DIR="${BASE_PRS_DIR:-/data/wzhougroup/yuanxin/GBMI/PRS/PRScs_output/MGBB/merged/EUR}"
-BASE_PHENO_DIR="${BASE_PHENO_DIR:-/data/wzhougroup/yuanxin/GBMI/PRS/PRS_eva/MGBB/EUR}"
-
 # ============================== Defaults ==============================
 TRAIT="${TRAIT:-}"              # required; e.g. T1D_to_CAD
-OUT_DIR="${OUT_DIR:-}"          # optional; defaults to {BASE_PHENO_DIR}/{TRAIT}
+OUT_DIR="${OUT_DIR:-}"          # required; each run gets its own output directory
 SCRIPT_DIR="${SCRIPT_DIR:-$(dirname "$(realpath "$0")")}"
 
 PIPELINE_VERSION="1.0.1-rc3"
@@ -119,30 +112,26 @@ RUN_06="${RUN_06:-1}"
 # ============================== CLI Parser ==============================
 usage() {
   cat <<'USAGE'
-Usage: ./00_run_pipeline_gbmi.sh --trait=TRAIT [--out-dir=DIR] [options]
+Usage: ./00_run_pipeline_gbmi.sh --trait=TRAIT --out-dir=DIR \
+         --onset-prs-file=FILE --progression-prs-file=FILE --outcome-prs-file=FILE \
+         --pheno-file=FILE [options]
 
 Required:
   --trait=STR               Trait name. Supports two formats:
                               ONSET_to_OUTCOME  (e.g. T1D_to_CAD, T2D_to_CAD)
                               ONSETtoOUTCOME   (e.g. PARKINSONtoDEMENTIA)
+  --out-dir=DIR             Output directory (created if absent). Give each
+                            trajectory / ancestry / PRS-method / analysis-layer its own.
+  --onset-prs-file=FILE        Onset (T0->T1) PRS .sscore
+  --progression-prs-file=FILE  Progression (T1->T2) PRS .sscore
+  --outcome-prs-file=FILE      Outcome (T0->T2) PRS .sscore
+  --pheno-file=FILE            Phenotype file
+  (All three PRS are mandatory. The four input files are needed only for a fitting
+   run; a downstream-only rerun with --run-01=0 works from existing RDS outputs.)
 
-Recommended (optional, but set it explicitly):
-  --out-dir=DIR             Output directory (created if absent). Optional — defaults to
-                            {BASE_PHENO_DIR}/{TRAIT} — but give each trajectory / ancestry /
-                            PRS-method / analysis-layer run its own directory to avoid mixing runs.
-
-GBMI paths (override if layout differs):
-  --base-prs-dir=DIR        Root for sscore files  (default: /GBMI/PRS/PRScs_output/MGBB/merged/EUR)
-  --base-pheno-dir=DIR      Root for pheno files   (default: /GBMI/PRS/PRS_eva/MGBB/EUR)
-
-Resolved automatically from TRAIT (can override individually):
+Trait name parts (optional; parsed from TRAIT for the run summary):
   --onset-name=STR          Onset sub-trait   (left of separator, e.g. PARKINSON)
   --outcome-name=STR        Outcome sub-trait (right of separator, e.g. DEMENTIA)
-  --onset-prs-file=FILE     Override onset sscore path
-  --progression-prs-file=FILE Override progression sscore path (default: {TRAIT}_score.sscore)
-  --outcome-prs-file=FILE   Override outcome sscore path
-  --pheno-file=FILE         Override phenotype file path
-  (All three PRS are mandatory; --no-progression has been removed.)
 
 Identity:
   --cohort=STR              (default: MGBB)
@@ -253,10 +242,6 @@ while (( $# )); do
     --script-dir=*)      SCRIPT_DIR="${1#*=}" ;;
     --script-dir)        shift; SCRIPT_DIR="$1" ;;
 
-    --base-prs-dir=*)    BASE_PRS_DIR="${1#*=}" ;;
-    --base-prs-dir)      shift; BASE_PRS_DIR="$1" ;;
-    --base-pheno-dir=*)  BASE_PHENO_DIR="${1#*=}" ;;
-    --base-pheno-dir)    shift; BASE_PHENO_DIR="$1" ;;
 
     --onset-name=*)      ONSET_NAME_OVERRIDE="${1#*=}" ;;
     --onset-name)        shift; ONSET_NAME_OVERRIDE="$1" ;;
@@ -404,32 +389,11 @@ fi
 [[ -n "$OUTCOME_NAME" ]] || die "Parsed outcome name is empty for trait '$TRAIT'. Use --outcome-name to set manually."
 
 # ============================== Resolve file paths ==============================
-# sscore: {BASE_PRS_DIR}/{sub_trait}/{sub_trait}_score.sscore
-if [[ -n "$ONSET_PRS_FILE_OVERRIDE" ]]; then
-  ONSET_PRS_PATH="$ONSET_PRS_FILE_OVERRIDE"
-else
-  ONSET_PRS_PATH="${BASE_PRS_DIR}/${ONSET_NAME}/${ONSET_NAME}_score.sscore"
-fi
-
-# Progression = the full compound trait (e.g. PARKINSONtoDEMENTIA_score.sscore)
-if [[ -n "$PROGRESSION_PRS_FILE_OVERRIDE" ]]; then
-  PROGRESSION_PRS_PATH="$PROGRESSION_PRS_FILE_OVERRIDE"
-else
-  PROGRESSION_PRS_PATH="${BASE_PRS_DIR}/${TRAIT}/${TRAIT}_score.sscore"
-fi
-
-if [[ -n "$OUTCOME_PRS_FILE_OVERRIDE" ]]; then
-  OUTCOME_PRS_PATH="$OUTCOME_PRS_FILE_OVERRIDE"
-else
-  OUTCOME_PRS_PATH="${BASE_PRS_DIR}/${OUTCOME_NAME}/${OUTCOME_NAME}_score.sscore"
-fi
-
-# pheno: {BASE_PHENO_DIR}/{TRAIT}/EUR_pheno_{TRAIT}.txt
-if [[ -n "$PHENO_FILE_OVERRIDE" ]]; then
-  PHENO_PATH="$PHENO_FILE_OVERRIDE"
-else
-  PHENO_PATH="${BASE_PHENO_DIR}/${TRAIT}/EUR_pheno_${TRAIT}.txt"
-fi
+# Inputs are supplied explicitly (required for a fitting run; validated below when RUN_01=1).
+ONSET_PRS_PATH="$ONSET_PRS_FILE_OVERRIDE"
+PROGRESSION_PRS_PATH="$PROGRESSION_PRS_FILE_OVERRIDE"
+OUTCOME_PRS_PATH="$OUTCOME_PRS_FILE_OVERRIDE"
+PHENO_PATH="$PHENO_FILE_OVERRIDE"
 # Covariates default to the phenotype file, but may live in a separate file.
 if [[ -n "$COV_FILE" ]]; then
   [[ -f "$COV_FILE" ]] || die "--cov-file not found: $COV_FILE"
@@ -443,23 +407,19 @@ fi
 # (--run-01=0) works purely from the RDS outputs, so skip these checks then and
 # rely on the per-stage "Missing 01 outputs" guards below.
 if [[ "$RUN_01" == "1" ]]; then
-[[ -f "$ONSET_PRS_PATH" ]] || die "Onset sscore not found: $ONSET_PRS_PATH
-  Expected: {BASE_PRS_DIR}/{ONSET}/{ONSET}_score.sscore
-  Override with --onset-prs-file=FILE"
+[[ -f "$ONSET_PRS_PATH" ]] || die "Onset PRS file not provided or not found: '$ONSET_PRS_PATH'
+  Pass it explicitly with --onset-prs-file=FILE"
 
 # All three PRS are required (onset, progression, outcome) — no partial runs.
-[[ -f "$PROGRESSION_PRS_PATH" ]] || die "Progression sscore not found: $PROGRESSION_PRS_PATH
-  Expected: {BASE_PRS_DIR}/{TRAIT}/{TRAIT}_score.sscore
-  Override with --progression-prs-file=FILE
-  (the three-PRS set is mandatory; --no-progression has been removed)"
+[[ -f "$PROGRESSION_PRS_PATH" ]] || die "Progression PRS file not provided or not found: '$PROGRESSION_PRS_PATH'
+  Pass it explicitly with --progression-prs-file=FILE
+  (the three-PRS set is mandatory)"
 
-[[ -f "$OUTCOME_PRS_PATH" ]] || die "Outcome sscore not found: $OUTCOME_PRS_PATH
-  Expected: {BASE_PRS_DIR}/{OUTCOME}/{OUTCOME}_score.sscore
-  Override with --outcome-prs-file=FILE"
+[[ -f "$OUTCOME_PRS_PATH" ]] || die "Outcome PRS file not provided or not found: '$OUTCOME_PRS_PATH'
+  Pass it explicitly with --outcome-prs-file=FILE"
 
-[[ -f "$PHENO_PATH" ]] || die "Phenotype file not found: $PHENO_PATH
-  Expected: {BASE_PHENO_DIR}/{TRAIT}/EUR_pheno_{TRAIT}.txt
-  Override with --pheno-file=FILE"
+[[ -f "$PHENO_PATH" ]] || die "Phenotype file not provided or not found: '$PHENO_PATH'
+  Pass it explicitly with --pheno-file=FILE"
 fi
 
 # R scripts
@@ -497,12 +457,11 @@ if [[ "$RUN_01" == "1" && "$ANALYSIS_MODE" == "prospective" ]]; then
   fi
 fi
 
-# Default output dir to {BASE_PHENO_DIR}/{TRAIT} if not specified.
-# Two subfolders:
+# --out-dir is required (give every run its own directory). Two subfolders are created:
 #   intermediate/  individual-level + working files (RDS design matrices, per-person
 #                  risk movement, logs) — do NOT share these outside your biobank.
 #   final/         aggregate, shareable summary tables and figures.
-OUT_DIR="${OUT_DIR:-${BASE_PHENO_DIR}/${TRAIT}}"
+[[ -n "$OUT_DIR" ]] || die "--out-dir is required (give each trajectory/ancestry/method/layer run its own directory)."
 WORK_DIR="${OUT_DIR}/intermediate"
 FINAL_DIR="${OUT_DIR}/final"
 mkdir -p "$WORK_DIR" "$FINAL_DIR"
@@ -524,18 +483,16 @@ if (( ${#_prov_missing[@]} )); then
   echo "  Supply them for a production run so the manifest records the discovery ancestry." >&2
 fi
 
-# Identity safety: the MGBB/EUR and /data/wzhougroup defaults are convenient locally but
-# mislabel outputs at another site. Warn loudly when an identity flag was NOT passed and
-# its site-specific default is being used (outputs are still computed correctly).
+# Identity safety: the MGBB/EUR defaults are convenient locally but mislabel outputs at
+# another site. Warn loudly when an identity flag was NOT passed and its default is used
+# (outputs are still computed correctly).
 _id_defaults=()
 [[ "${COHORT_EXPLICIT:-0}" != "1" ]]   && _id_defaults+=("--cohort (using default '$COHORT')")
 [[ "${ANCESTRY_EXPLICIT:-0}" != "1" ]] && _id_defaults+=("--ancestry (using default '$ANCESTRY')")
-[[ "$BASE_PRS_DIR"   == /data/wzhougroup/* ]] && _id_defaults+=("--base-prs-dir (MGBB path)")
-[[ "$BASE_PHENO_DIR" == /data/wzhougroup/* ]] && _id_defaults+=("--base-pheno-dir (MGBB path)")
 if (( ${#_id_defaults[@]} )); then
-  echo "⚠ SITE IDENTITY: using built-in MGBB defaults for: ${_id_defaults[*]}" >&2
+  echo "⚠ SITE IDENTITY: using built-in defaults for: ${_id_defaults[*]}" >&2
   echo "  Outputs will be LABELLED '${COHORT}_${ANCESTRY}'. If that is not your site, pass" >&2
-  echo "  --cohort / --ancestry (and file paths) explicitly so results are not mislabelled." >&2
+  echo "  --cohort / --ancestry explicitly so results are not mislabelled." >&2
 fi
 
 BASE_STEM="${COHORT}_${ANCESTRY}_${PRS_METHOD}_${TRAIT}"

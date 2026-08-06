@@ -1261,6 +1261,15 @@ extra_terms <- character(0)
 strata_term <- character(0)
 spline_or_linear <- function(col, label) {
   nd <- length(unique(DT[[col]][is.finite(DT[[col]])]))
+  if (nd < 2) {
+    # Constant covariate: unestimable. Entering it yields an NA coefficient that
+    # later breaks riskRegression's predictCox ("parameters ... have no value 'NA'").
+    # This happens for T1_DURATION when the prospective sample is all-incident (e.g. a
+    # register/birth-start cohort indexed at birth -> everyone incident -> T1_DURATION=0).
+    cat("  ⚠ Covariate ", col, " is constant (", nd, " distinct value); dropped from the model (",
+        label, ")\n", sep="")
+    return(character(0))
+  }
   if (opt$age_spline_df > 0 && nd >= 4) {
     t <- sprintf("ns(%s, df=%d)", col, opt$age_spline_df)
     cat("  Covariate: ", t, " (", label, ")\n", sep=""); t

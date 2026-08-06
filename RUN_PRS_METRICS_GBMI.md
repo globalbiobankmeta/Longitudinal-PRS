@@ -312,6 +312,19 @@ IID    age_at_recruitment
 1003   63.8
 ```
 
+**What the recruitment age is (important for register / birth-start cohorts).** Layer 2 is a
+*prospective* analysis, so the recruitment age must be the age at the **prospective baseline** — i.e.
+when the participant **enters the biobank cohort** (DNA-sample collection / enrollment / consent), when
+the genotype and covariates are measured and prospective observation begins. This is the age relative
+to which the pipeline splits **prevalent** (T1 before the baseline) from **incident** (T1 at/after the
+baseline).
+
+Do **not** use the register / birth start of follow-up as the recruitment age. If the recruitment age
+is at (or before) everyone's T1 — e.g. a register cohort like FinnGen whose follow-up starts at birth —
+then *everyone* becomes incident, the analysis collapses toward Layer 1, and it introduces
+immortal-time bias. For such cohorts, set `--recruit-age-col` to the **age at biobank sample /
+enrollment**, not the register start.
+
 ---
 
 <a id="section-4-5"></a>
@@ -693,6 +706,7 @@ The `final/` folder contains the aggregate outputs and run information needed by
 | Too few events | Notify the coordinating team that the trajectory cannot be analyzed |
 | Many people are dropped | Check overlap among the three PRS files and the phenotype file |
 | Layer 2 fails | Confirm `RECRUIT` and `RECRUIT_AGE_COL` |
+| Layer 2 stops with `predictCox ... 'NA'` after fitting | A model covariate is constant — usually `T1_DURATION`, because the sample is all-*incident* (recruitment age set to the register/birth start, so every T1 is "after recruitment"). Set `--recruit-age-col` to the biobank sample/enrollment age (§4.4). The pipeline now also drops the constant term automatically. |
 | Path with spaces fails | Quote all paths; when needed, move the pipeline to a path without special characters |
 | `RUN COMPLETE: no` | Keep the job output and contact the coordinating team |
 
