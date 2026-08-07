@@ -3,7 +3,7 @@
 # 05_calibration.R - Calibration Analysis for Survival Models
 #   - All Cox models from 01_fit_models.R (base, minimal, full, quantiles, extremes, ...)
 #   - Metrics at chosen times: slope, intercept, R², ICI, E-statistic
-#   - Point metrics: CIL, O/E, E50, E90
+#   - Point metrics: CIL, O/E, obs_minus_pred_q50, obs_minus_pred_q90
 #   - Grouped calibration (Nam–D’Agostino–Greenwood) by risk quantiles
 #   - Recalibration modes (applied per model × time):
 #       raw, recal_int, recal_slope, recal_int_slope, platt, isotonic
@@ -388,9 +388,14 @@ point_calibration_metrics_from_risk <- function(DT, risk, t, timeCol="TIME", sta
   k50 <- km_at_time(DT[nn_idx(q50), ], timeCol, statusCol, t)
   k90 <- km_at_time(DT[nn_idx(q90), ], timeCol, statusCol, t)
   O50 <- 1 - k50$S; O90 <- 1 - k90$S
-  E50 <- O50 - q50;  E90 <- O90 - q90
-  
-  list(CIL=CIL, OE=OE, O=O_all, E=E_all, E50=E50, E90=E90)
+  # Signed observed-minus-predicted gap among individuals near the 50th and 90th
+  # percentiles of PREDICTED risk. These are NOT "expected" risks, and NOT Austin's
+  # E50/E90 (percentiles of |obs-pred| over the whole range) — named for exactly what
+  # they are so the published metric is not misread as an expected value.
+  obs_minus_pred_q50 <- O50 - q50;  obs_minus_pred_q90 <- O90 - q90
+
+  list(CIL=CIL, OE=OE, O=O_all, E=E_all,
+       obs_minus_pred_q50=obs_minus_pred_q50, obs_minus_pred_q90=obs_minus_pred_q90)
 }
 
 fit_recalibration_params <- function(tab) {
@@ -592,7 +597,7 @@ for (model_name in models_to_assess) {
         r2 <- summary(lmfit)$r.squared
       }
       
-      # Point metrics (CIL, O/E, E50, E90) for this mode
+      # Point metrics (CIL, O/E, obs_minus_pred_q50/q90) for this mode
       pm <- point_calibration_metrics_from_risk(DT_t, risk = r_mode, t = t, timeCol=timeCol, statusCol=statusCol)
       
       cat(sprintf("    [%s] χ²=%.3f (df=%d), p=%.3g | slope=%.3f, int=%.3f | ICI=%.4f | CIL=%.3f, O/E=%.3f\n",
@@ -615,7 +620,7 @@ for (model_name in models_to_assess) {
         r_squared = r2,
         ICI = ICI_val, E_statistic = E_stat,
         CIL = pm$CIL, OE = pm$OE, O_overall = pm$O, E_overall = pm$E,
-        E50 = pm$E50, E90 = pm$E90,
+        obs_minus_pred_q50 = pm$obs_minus_pred_q50, obs_minus_pred_q90 = pm$obs_minus_pred_q90,
         grouped_chisq = gc$chisq, grouped_df = gc$df, grouped_p = gc$pval,
         n_groups = nrow(tbl),
         # Sample actually used at this horizon: predicted and observed are computed

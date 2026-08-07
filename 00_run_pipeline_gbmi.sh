@@ -36,7 +36,6 @@ PRS_METHOD="${PRS_METHOD:-PRScs}"                # goes into the output prefix (
 
 # Optional provenance recorded verbatim in the session manifest (no analysis effect)
 DISCOVERY_ANCESTRY="${DISCOVERY_ANCESTRY:-}"
-TARGET_ANCESTRY="${TARGET_ANCESTRY:-}"            # defaults to --ancestry (applied post-parse)
 RUN_TESTS="${RUN_TESTS:-1}"                      # run helper unit tests in preflight
 
 STATUS_COL="${STATUS_COL:-secondEvent}"
@@ -79,6 +78,7 @@ RISK_MODEL="${RISK_MODEL:-M5}"                   # stage 06 model for predicted 
 SCORE_ROLE="${SCORE_ROLE:-all}"                  # which PRS drives 02/06 displays
 ROLE_QUANTILES="${ROLE_QUANTILES:-Q5,Q10}"       # quantile schemes per role
 INCIDENT_LAG_DAYS="${INCIDENT_LAG_DAYS:-0}"
+PROSPECTIVE_T1="${PROSPECTIVE_T1:-both}"   # prospective: include both T1 states, or incident T1 only
 LAG_DAYS="${LAG_DAYS:-0,30,90,365}"              # Layer 3 sweep; lag 0 = primary
 MIN_EVENTS_TOTAL="${MIN_EVENTS_TOTAL:-50}"
 
@@ -148,7 +148,6 @@ Columns:
   --prs-method=STR          PRS method, embedded in the output prefix (default: PRScs)
   --run-tests=0|1           Run helper unit tests in preflight (default: 1)
   --discovery-ancestry=STR    Provenance recorded in the session manifest (verbatim)
-  --target-ancestry=STR       Provenance recorded in the session manifest (verbatim; defaults to --ancestry)
   --prs-score-col=NAME      Column name inside .sscore files (default: SCORE1_SUM)
 
 Time scale (supply exactly ONE, explicitly — there is no implicit default):
@@ -181,6 +180,10 @@ Analysis layers:
   --pop-file=FILE           Optional keep-list (FID IID); restrict the analysis to these IIDs — e.g.
                             unrelated individuals, or one target ancestry. Default: use the whole input.
   --incident-lag-days=NUM   prospective: lag added to the T1 index for incident T1 (default: 0)
+  --prospective-t1=WHICH    prospective: "both" (default) keeps prevalent T1 alongside incident T1,
+                            indexing prevalent people at recruitment and separating the two with
+                            strata(T1_STATUS) + a T1-duration term. "incident" restricts to T1 that
+                            occurs after recruitment: one clean time-since-T1 clock, smaller sample.
   --lag-days=CSV            Layer 3 washout sweep; 0 = primary (default: 0,30,90,365)
   --min-events-total=INT    Hard floor on total T2 events (default: 50)
 
@@ -277,6 +280,8 @@ while (( $# )); do
     --pop-file)          shift; POP_FILE="$1" ;;
     --incident-lag-days=*) INCIDENT_LAG_DAYS="${1#*=}" ;;
     --incident-lag-days)   shift; INCIDENT_LAG_DAYS="$1" ;;
+    --prospective-t1=*)  PROSPECTIVE_T1="${1#*=}" ;;
+    --prospective-t1)    shift; PROSPECTIVE_T1="$1" ;;
     --lag-days=*)        LAG_DAYS="${1#*=}" ;;
     --lag-days)          shift; LAG_DAYS="$1" ;;
     --min-events-total=*) MIN_EVENTS_TOTAL="${1#*=}" ;;
@@ -292,7 +297,6 @@ while (( $# )); do
     --prs-method=*)      PRS_METHOD="${1#*=}" ;;
     --run-tests=*)       RUN_TESTS="${1#*=}" ;;
     --discovery-ancestry=*)   DISCOVERY_ANCESTRY="${1#*=}" ;;
-    --target-ancestry=*)      TARGET_ANCESTRY="${1#*=}" ;;
     --reclass-pair=*)    RECLASS_PAIR="${1#*=}" ;;
     --risk-model=*)      RISK_MODEL="${1#*=}" ;;
     --score-role=*)      SCORE_ROLE="${1#*=}" ;;
@@ -332,7 +336,7 @@ while (( $# )); do
     --prs-extremes=*)    PRS_EXTREMES="${1#*=}" ;;
     --prs-extremes)      shift; PRS_EXTREMES="$1" ;;
     --use_supported_times=*)  USE_SUPPORTED_TIMES="${1#*=}" ;;
-    --use_supported_times)    shift; USE_SUPPORTED_TIMES="${1:-1}" ;;
+    --use_supported_times)    USE_SUPPORTED_TIMES=1 ;;
 
     --run-01=*)  RUN_01="${1#*=}" ;;
     --run-01)    shift; RUN_01="$1" ;;
@@ -358,6 +362,40 @@ die()  { echo -e "ERROR: $*" >&2; exit 1; }
 info() { echo -e "\n==> $*\n"; }
 uset() { [[ "$USE_SUPPORTED_TIMES" == "1" ]] && echo "--use_supported_times" || true; }
 opt()  { local name="$1" value="${2:-}"; [[ -n "$value" ]] && printf -- "%s %q " "$name" "$value" || true; }
+
+# ---- run_stage: invoke a stage and, on failure, SHOW WHY -----------------------
+# Every stage redirects its own stderr into a log with sink(type="message"), so a
+# fatal R error never reaches this console. Combined with `set -e` that made any
+# stage failure silent: the run just stopped mid-output with no message and no
+# hint that a log existed. Print the tail of the right log before dying.
+#
+# Two naming conventions are in use and both must be searched: 01 writes
+# <prefix>fit_models.log and 03 writes <prefix>discrimination_metrics.log, while
+# 02/04/05/06 all write <prefix>log.txt.
+run_stage() {
+  local label="$1" script="$2"; shift 2
+  # Capture the stage's REAL exit code. `if Rscript ...; then return 0; fi` would
+  # leave $? = 0 on failure (a false if with no else returns 0), so the message
+  # below reported "exited 0" for a stage that actually died. `&& return 0` keeps
+  # the failing code in $? for the rc capture.
+  Rscript "$script" "$@" && return 0
+  local rc=$?
+  echo "" >&2
+  echo "ERROR: stage ${label} exited ${rc}. Its R error is in the stage log, not on this console." >&2
+  local newest="" f
+  for f in "${WORK_DIR}"/*fit_models.log "${WORK_DIR}"/*discrimination_metrics.log "${WORK_DIR}"/*log.txt; do
+    [[ -f "$f" ]] || continue
+    [[ -z "$newest" || "$f" -nt "$newest" ]] && newest="$f"
+  done
+  if [[ -n "$newest" ]]; then
+    echo "--- last 40 lines of $(basename "$newest") ---" >&2
+    tail -40 "$newest" >&2
+    echo "--- full log: $newest ---" >&2
+  else
+    echo "  (no stage log found under $WORK_DIR — the stage may have failed before opening one)" >&2
+  fi
+  die "stage ${label} failed."
+}
 
 # ============================== Validate required args ==============================
 [[ -n "$TRAIT" ]] || die "--trait is required. E.g.: --trait=T1D_to_CAD"
@@ -456,6 +494,15 @@ if [[ "$RUN_01" == "1" && "$ANALYSIS_MODE" == "prospective" ]]; then
     die "--analysis-mode=prospective cannot be combined with a lag sweep. Set --lag-days=0 for prospective, and run the lag sensitivity as a separate gwas_aligned job."
   fi
 fi
+# Validate here as well as in stage 01, so a typo fails before the run starts
+# rather than after the PRS files have been read.
+case "$PROSPECTIVE_T1" in
+  both|incident) ;;
+  *) die "--prospective-t1 must be 'both' or 'incident' (got '$PROSPECTIVE_T1')." ;;
+esac
+if [[ "$ANALYSIS_MODE" != "prospective" && "$PROSPECTIVE_T1" != "both" ]]; then
+  die "--prospective-t1=$PROSPECTIVE_T1 only applies to --analysis-mode=prospective."
+fi
 
 # --out-dir is required (give every run its own directory). Two subfolders are created:
 #   intermediate/  individual-level + working files (RDS design matrices, per-person
@@ -475,7 +522,6 @@ echo "  final (candidate aggregate outputs; local review required): $FINAL_DIR"
 # Provenance defaults + completeness (post-parse). Target ancestry defaults to the
 # analysis ancestry; warn (do not fail at rc2) on blank provenance so a site knows
 # these fields are MISSING in the returned manifest.
-[[ -z "$TARGET_ANCESTRY" ]] && TARGET_ANCESTRY="$ANCESTRY"
 _prov_missing=()
 [[ -z "$DISCOVERY_ANCESTRY" ]]   && _prov_missing+=("--discovery-ancestry")
 if (( ${#_prov_missing[@]} )); then
@@ -500,6 +546,14 @@ PREFIX="$BASE_STEM"
 # 01 appends the analysis mode to its auto-prefix for non-default modes; mirror
 # that here so FM_MAIN/DT_MAIN (and the downstream stages) resolve in prospective mode.
 [[ "$ANALYSIS_MODE" != "gwas_aligned" ]] && PREFIX="${PREFIX}_${ANALYSIS_MODE}"
+# 01 also appends an "incidentLag<N>d" component when --incident_lag_days > 0 (passed
+# only in prospective mode). Mirror it too, or the driver's FM_MAIN/DT_MAIN would point
+# at "..._prospective_01_..." while 01 self-names "..._prospective_incidentLag<N>d_01_...",
+# and every downstream stage would die "Missing 01 outputs" though 01 succeeded. awk gives
+# a float-safe >0 test. (The main stage-01 call always runs lag_days=0, so no "lag<N>d".)
+if [[ "$ANALYSIS_MODE" == "prospective" ]] && awk "BEGIN{exit !((${INCIDENT_LAG_DAYS:-0})>0)}"; then
+  PREFIX="${PREFIX}_incidentLag${INCIDENT_LAG_DAYS}d"
+fi
 
 # ============================== Package preflight ==============================
 # CHECK versions; do NOT install. Silent runtime installation fails in biobanks
@@ -544,7 +598,7 @@ for s in "$S01" "$S02" "$S03" "$S04" "$S05" "$S06" "$SUTIL"; do
 done
 CKSUM_LINES+="test_script=$(_sha "${SCRIPT_DIR}/test_prs_risk_utils.R")"$'\n'
 [[ -f "${SCRIPT_DIR}/smoke_test.sh" ]]      && CKSUM_LINES+="script:smoke_test.sh=$(_sha "${SCRIPT_DIR}/smoke_test.sh")"$'\n'
-[[ -f "${SCRIPT_DIR}/RUN_PRS_METRICS.md" ]] && CKSUM_LINES+="doc:RUN_PRS_METRICS.md=$(_sha "${SCRIPT_DIR}/RUN_PRS_METRICS.md")"$'\n'
+[[ -f "${SCRIPT_DIR}/RUN_PRS_METRICS_GBMI.md" ]] && CKSUM_LINES+="doc:RUN_PRS_METRICS_GBMI.md=$(_sha "${SCRIPT_DIR}/RUN_PRS_METRICS_GBMI.md")"$'\n'
 if [[ "$RUN_01" == "1" ]]; then
   CKSUM_LINES+="prs_onset=$(_sha "$ONSET_PRS_PATH")"$'\n'
   CKSUM_LINES+="prs_progression=$(_sha "$PROGRESSION_PRS_PATH")"$'\n'
@@ -556,7 +610,7 @@ if [[ "$RUN_01" == "1" ]]; then
 fi
 PRS_MANIFEST="$MANIFEST_FILE" PRS_VERSION="$PIPELINE_VERSION" PRS_REQ_PKGS="$REQ_PKGS" \
   PRS_CKSUMS="$CKSUM_LINES" PRS_METHOD="$PRS_METHOD" \
-  PRS_DISC_ANC="$DISCOVERY_ANCESTRY" PRS_TARG_ANC="$TARGET_ANCESTRY" \
+  PRS_DISC_ANC="$DISCOVERY_ANCESTRY" PRS_TARG_ANC="$ANCESTRY" \
   Rscript - <<'RCHECK'
 # Enforce R version first (was recorded but not checked).
 if (getRversion() < "4.1.0") {
@@ -671,6 +725,13 @@ fi
 FM_MAIN="${WORK_DIR}/${PREFIX}_01_fit_models_fitted_models.rds"
 DT_MAIN="${WORK_DIR}/${PREFIX}_01_fit_models_data_processed.rds"
 
+# Stages 03/04 gate time-point inclusion (hence the smallest counts they publish)
+# on --min_events, which the driver previously left at each stage's own default of
+# 10 regardless of --min-cell-count. Make that floor the STRICTER of the reliability
+# minimum (10) and the disclosure threshold, so raising --min-cell-count tightens
+# 03/04 too without ever letting the reliability floor drop below 10.
+MIN_EVENTS_0304=$(( MIN_CELL_COUNT > 10 ? MIN_CELL_COUNT : 10 ))
+
 # ============================== Detect score column ==============================
 # Peek at the header of the onset sscore file; fall back to PRS_SCORE_COL default.
 # 01_fit_models.R also has grep fallback for the extra PRS files.
@@ -776,7 +837,7 @@ if [[ -n "$RECRUIT_FILE" && -f "$RECRUIT_FILE" ]]; then
   MODE_ARGS+=(--recruit_file "$RECRUIT_FILE" --recruit_age_col "$RECRUIT_AGE_COL")
 fi
 if [[ "$ANALYSIS_MODE" == "prospective" ]]; then
-  MODE_ARGS+=(--incident_lag_days "$INCIDENT_LAG_DAYS")
+  MODE_ARGS+=(--incident_lag_days "$INCIDENT_LAG_DAYS" --prospective_t1 "$PROSPECTIVE_T1")
 fi
 
 # Shareable run configuration (published) — records exactly how this job was run, so a
@@ -794,7 +855,7 @@ if [[ "$RUN_01" == "1" ]]; then
   echo "trait,${TRAIT}"
   echo "analysis_mode,${ANALYSIS_MODE}"
   echo "discovery_ancestry,${DISCOVERY_ANCESTRY}"
-  echo "target_ancestry,${TARGET_ANCESTRY}"
+  echo "target_ancestry,${ANCESTRY}"
   echo "age_t1_col,${AGE_T1_COL}"
   echo "age_exit_col,${AGE_EXIT_COL}"
   echo "time_exit_col,${TIME_EXIT}"
@@ -806,7 +867,7 @@ if [[ "$RUN_01" == "1" ]]; then
   echo "min_events_total,${MIN_EVENTS_TOTAL}"
   echo "min_cell_count,${MIN_CELL_COUNT}"
   echo "contrast_pairs,\"${CONTRAST_PAIRS}\""
-  echo "score_roles,\"onset,outcome,progression\""
+  echo "score_roles,\"${SCORE_ROLE}\""
   echo "calculate_rmst,${CALC_RMST}"
   echo "calculate_uno,${CALC_UNO}"
   echo "stages,\"01=${RUN_01} 02=${RUN_02} 03=${RUN_03} 04=${RUN_04} 05=${RUN_05} 06=${RUN_06}\""
@@ -817,6 +878,7 @@ if [[ "$RUN_01" == "1" ]]; then
   echo "sex_col,${SEX_COL}"
   echo "recruit_age_col,${RECRUIT_AGE_COL}"
   echo "incident_lag_days,${INCIDENT_LAG_DAYS}"
+  echo "prospective_t1,${PROSPECTIVE_T1}"
   echo "prs_quantiles,\"${PRS_QUANTILES}\""
   echo "prs_extremes,\"${PRS_EXTREMES}\""
   echo "role_quantiles,\"${ROLE_QUANTILES}\""
@@ -826,6 +888,7 @@ if [[ "$RUN_01" == "1" ]]; then
   echo "risk_thresholds,\"${RISK_THRESHOLDS}\""
   echo "rmst_n_boot,${RMST_N_BOOT}"
   echo "bootstrap_risk_differences,${BOOTSTRAP_RISK_DIFFERENCES}"
+  echo "enable_clinical_utility,${ENABLE_CLINICAL_UTILITY}"
 } > "$RUNCFG"
 info "Wrote run configuration: $(basename "$RUNCFG")"
 fi   # end RUN_01==1 run_configuration guard
@@ -833,7 +896,7 @@ fi   # end RUN_01==1 run_configuration guard
 # ============================== Stage 01 (main, lag 0) ==============================
 if [[ "$RUN_01" == "1" ]]; then
   info "01 — fitting multi-PRS Cox models (M0-M7)"
-  Rscript "$S01" \
+  run_stage 01 "$S01" \
     --prs_file        "$ONSET_PRS_PATH" \
     --prs_col         "$ONSET_COL" \
     --pheno_file      "$PHENO_PATH" \
@@ -859,11 +922,13 @@ fi
 if [[ "$RUN_03" == "1" ]]; then
   info "03 — discrimination metrics (AUC, Brier, iAUC, IBS)"
   [[ -f "$FM_MAIN" && -f "$DT_MAIN" ]] || die "Missing 01 outputs — run stage 01 first."
-  Rscript "$S03" \
+  run_stage 03 "$S03" \
     --fitted_models  "$FM_MAIN" \
     --data_processed "$DT_MAIN" \
     --prefix "$PREFIX" \
     --contrast_pairs "$CONTRAST_PAIRS" \
+    --time_points "$TIME_POINTS" \
+    --min_events "$MIN_EVENTS_0304" \
     $(uset) \
     --outdir "$WORK_DIR"
 fi
@@ -886,20 +951,22 @@ if [[ "$RUN_02" == "1" ]]; then
     # uninterpretable. ~25 s at 200 reps on ~6.6k rows.
     [[ "$RMST_N_BOOT" -gt 0 ]] && KM_ARGS+=(--rmst_bootstrap --rmst_n_boot "$RMST_N_BOOT")
   fi
-  Rscript "$S02" "${KM_ARGS[@]}"
+  run_stage 02 "$S02" "${KM_ARGS[@]}"
 fi
 
 # ============================== Stage 04 ==============================
 if [[ "$RUN_04" == "1" ]]; then
   info "04 — reclassification (IDI / NRI)"
   [[ -f "$FM_MAIN" && -f "$DT_MAIN" ]] || die "Missing 01 outputs — run stage 01 first."
-  Rscript "$S04" \
+  run_stage 04 "$S04" \
     --models_file    "$FM_MAIN" \
     --data_file      "$DT_MAIN" \
     --risk_thresholds "$RISK_THRESHOLDS" \
     --prefix "$PREFIX" \
     --reference_model "$RECLASS_REF" \
     --comparison_model "$RECLASS_COMP" \
+    --time_points "$TIME_POINTS" \
+    --min_events "$MIN_EVENTS_0304" \
     $(uset) \
     --outdir "$WORK_DIR"
 fi
@@ -908,7 +975,7 @@ fi
 if [[ "$RUN_05" == "1" ]]; then
   info "05 — calibration"
   [[ -f "$FM_MAIN" && -f "$DT_MAIN" ]] || die "Missing 01 outputs — run stage 01 first."
-  Rscript "$S05" \
+  run_stage 05 "$S05" \
     --models_file "$FM_MAIN" \
     --data_file   "$DT_MAIN" \
     --n_groups 10 \
@@ -932,7 +999,7 @@ if [[ "$RUN_06" == "1" ]]; then
            --risk_model "$RISK_MODEL" --min_cell_count "$MIN_CELL_COUNT")
   [[ "$ENABLE_CLINICAL_UTILITY" == "1" ]] && CI_ARGS+=(--enable_clinical_utility)
   [[ "$BOOTSTRAP_RISK_DIFFERENCES" == "1" ]] && CI_ARGS+=(--bootstrap_risk_differences)
-  Rscript "$S06" "${CI_ARGS[@]}" $(uset) --outdir "$WORK_DIR"
+  run_stage 06 "$S06" "${CI_ARGS[@]}" $(uset) --outdir "$WORK_DIR"
 fi
 
 # ============================== Lag sensitivity sweep (Layer 3) ==============================
@@ -949,7 +1016,7 @@ if [[ "$RUN_01" == "1" ]]; then
     mkdir -p "$LAG_DIR"
     info "Lag sensitivity: refitting M0-M7 with washout > ${L} days (stage 01 only)"
     LAG_PREFIX="${BASE_STEM}_lag${L}"
-    Rscript "$S01" \
+    run_stage "01 (lag ${L}d)" "$S01" \
       --prs_file        "$ONSET_PRS_PATH" \
       --prs_col         "$ONSET_COL" \
       --pheno_file      "$PHENO_PATH" \

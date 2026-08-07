@@ -199,10 +199,18 @@ predict_risk_at_horizon <- function(fit, newdata, horizon,
   #    other). reference="sample" puts the linear predictor on the same overall
   #    reference as basehaz. For an unstratified model the two are identical, so
   #    this cannot move non-stratified results.
-  lp <- tryCatch(as.numeric(stats::predict(fit, newdata = newdata, type = "lp",
-                                           reference = "sample")),
-                 error = function(e) NULL)
-  if (is.null(lp) || !length(lp)) return(rep(NA_real_, n))
+  # Covariate-free models (e.g. ~ strata(X)) have no coefficients; lp is 0 for all.
+  # Some survival builds error inside predict() for such a fit, which the tryCatch
+  # below would turn into an all-NA risk vector; others return zeros. Branch first
+  # so the result is the same either way.
+  if (length(stats::coef(fit)) == 0L) {
+    lp <- rep(0, n)
+  } else {
+    lp <- tryCatch(as.numeric(stats::predict(fit, newdata = newdata, type = "lp",
+                                             reference = "sample")),
+                   error = function(e) NULL)
+    if (is.null(lp) || !length(lp)) return(rep(NA_real_, n))
+  }
 
   base <- .baseline_survival(fit)
   if (is.null(base)) return(rep(NA_real_, n))

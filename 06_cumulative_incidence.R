@@ -1067,11 +1067,22 @@ cat("===========================================================================
 # curves described M1, not the manuscript's M5/M2 comparison.
 .resolve_risk_model <- function(want) {
   mm <- results$metadata$model_map
+  # Case-insensitive match against the fitted-list names. The model_map labels the
+  # covariate-only model "Base", but stage 01 keys the fitted list lowercase "base"
+  # (03/04/05 alias this too); without the fold, --risk_model=M0 / Base would stop().
+  .ci_name <- function(x) {
+    hit <- names(fitted_models)[tolower(names(fitted_models)) == tolower(x)]
+    if (length(hit)) hit[1] else NA_character_
+  }
   if (!is.null(want) && nzchar(want)) {
     if (want %in% names(fitted_models)) return(want)
+    ci <- .ci_name(want); if (!is.na(ci)) return(ci)   # e.g. want="Base" -> "base"
     if (!is.null(mm)) {
       hit <- as.data.table(mm)[model_id == want, model]
-      if (length(hit) && hit[1] %in% names(fitted_models)) return(as.character(hit[1]))
+      if (length(hit)) {
+        if (hit[1] %in% names(fitted_models)) return(as.character(hit[1]))
+        ci <- .ci_name(hit[1]); if (!is.na(ci)) return(ci)  # e.g. M0 -> "Base" -> "base"
+      }
     }
     stop("--risk_model '", want, "' not found. Available: ",
          paste(names(fitted_models), collapse = ", "))

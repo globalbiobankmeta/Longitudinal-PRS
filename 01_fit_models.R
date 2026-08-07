@@ -173,6 +173,13 @@ option_list <- list(
               help="Column in --recruit_file holding age at recruitment [default: age_at_recruitment]"),
   make_option("--incident_lag_days", type="numeric", default=0,
               help="Prospective mode: add this lag (days) to the T1 index for incident T1 [default: 0]"),
+  # Which T1 states enter the prospective analysis. 'both' (default, unchanged
+  # behaviour) keeps prevalent T1 alongside incident T1, indexing prevalent people at
+  # recruitment and separating the two with strata(T1_STATUS) + a T1_DURATION term.
+  # 'incident' restricts to T1 occurring after recruitment, giving one clean
+  # time-since-T1 clock at the cost of the prevalent sample.
+  make_option("--prospective_t1", type="character", default="both",
+              help="Prospective mode: which T1 states to include, 'both' or 'incident' [default: both]"),
   # >>> Lag sensitivity (Layer 3): drop anyone with time_since_T1 <= lag/365.25
   make_option("--lag_days", type="numeric", default=0,
               help="Exclude transitions with time_since_T1 <= lag_days (a single value; the driver sweeps 0/30/90/365) [default: 0]"),
@@ -349,6 +356,51 @@ record_stage <- function(dt, label, status_col = "PHENO") {
   ev <- if (!is.null(dt) && status_col %in% names(dt)) sum(dt[[status_col]] == 1, na.rm = TRUE) else NA_integer_
   attrition_log[[length(attrition_log) + 1L]] <<- data.table::data.table(stage = label, N_remaining = n, events_remaining = ev)
   invisible(NULL)
+}
+
+# ------------------------------------------------------------------------------
+# .aeqsurv_keep() — which rows survive survival's own time-resolution rounding.
+#
+# survival::aeqSurv() (called by coxph via timefix=TRUE) rounds event times to the
+# data's effective resolution and HARD-ERRORS — "aeqSurv exception, an interval has
+# effective length 0" — if any interval collapses. A strict STOP > START test does
+# NOT prevent this: two ages derived from the SAME date can differ by ~1e-13 through
+# float cancellation, pass `> START`, and then round to zero length. Those rows are
+# same-age T1/T2 transitions, which this pipeline already excludes by policy (see
+# --min_followup_threshold), so apply aeqSurv's own rule and make the exclusion
+# float-safe instead of leaving coxph to abort mid-fit.
+#
+# The rule is aeqSurv's verbatim: consecutive sorted unique times merge when the gap
+# is <= tolerance OR gap/mean(abs(times)) <= tolerance. Returns a logical vector,
+# TRUE = the interval still spans at least one cut boundary.
+# ------------------------------------------------------------------------------
+.aeqsurv_keep <- function(start, stop, tolerance = sqrt(.Machine$double.eps)) {
+  y <- sort(unique(c(start, stop))); y <- y[is.finite(y)]
+  if (length(y) < 2L) return(rep(TRUE, length(start)))
+  dy   <- diff(y)
+  tied <- (dy <= tolerance) | (dy / mean(abs(y)) <= tolerance)
+  if (!any(tied)) return(rep(TRUE, length(start)))
+  cuts <- y[c(TRUE, !tied)]
+  findInterval(start, cuts) != findInterval(stop, cuts)
+}
+
+# Drop rows whose Surv interval collapses under aeqSurv, asking aeqSurv itself
+# (the arbiter coxph uses) rather than trusting one pass of the rule above: the
+# cut points and mean(abs(y)) both shift as rows are removed. Returns the subset.
+.drop_degenerate_intervals <- function(dt, what = "sample") {
+  for (.i in 1:5) {
+    ok <- tryCatch({ survival::aeqSurv(survival::Surv(dt$START, dt$STOP, dt$PHENO)); TRUE },
+                   error = function(e) FALSE)
+    if (ok) return(dt)
+    k <- .aeqsurv_keep(dt$START, dt$STOP)
+    if (all(k))
+      stop("Surv intervals in the ", what, " still collapse under aeqSurv, but no row ",
+           "is identifiable as degenerate; inspect START/STOP.")
+    cat("  ⚠ Removing ", sum(!k), " row(s) from the ", what,
+        " whose interval collapses at survival's time resolution\n", sep = "")
+    dt <- dt[k]
+  }
+  stop("Could not resolve degenerate Surv intervals in the ", what, " after 5 passes.")
 }
 
 # Disclosure helper (identical to prs_risk_utils::suppress_small_cells; inlined
@@ -747,6 +799,26 @@ if (!is.null(opt$recruit_file) && file.exists(opt$recruit_file)) {
     stop("Column '", opt$recruit_age_col, "' not found in --recruit_file")
   prs <- merge(prs, .rec[, c("IID", opt$recruit_age_col), with=FALSE], by="IID", all.x=TRUE)
   prs[, AGE_RECRUIT := as.numeric(get(opt$recruit_age_col))]
+  # COVERAGE. This is a LEFT join: IIDs absent from the recruitment file get
+  # AGE_RECRUIT = NA. In prospective mode every NA row is unusable, and it used to
+  # vanish silently (NA propagated through timing_category, and data.table drops NA
+  # rows on a `!=` filter). A partial recruitment file could therefore redefine the
+  # analysis cohort without saying so. Report it loudly in EVERY mode.
+  recruit_coverage_total <- nrow(prs)
+  recruit_coverage_n     <- sum(!is.na(prs$AGE_RECRUIT))
+  recruit_coverage_pct   <- if (recruit_coverage_total > 0)
+                              100 * recruit_coverage_n / recruit_coverage_total else NA_real_
+  cat(sprintf("  Recruitment-age coverage: %d of %d (%.1f%%)\n",
+              recruit_coverage_n, recruit_coverage_total, recruit_coverage_pct))
+  if (recruit_coverage_n < recruit_coverage_total) {
+    cat("  ⚠ ", recruit_coverage_total - recruit_coverage_n,
+        " individual(s) have NO recruitment age.\n", sep="")
+    if (identical(opt$analysis_mode, "prospective"))
+      cat("    In prospective mode these CANNOT be indexed and are excluded below.\n",
+          "    Check that --recruit_file covers the same individuals as the phenotype file.\n", sep="")
+    else
+      cat("    gwas_aligned: recruitment age is descriptive only; no rows are excluded for this.\n")
+  }
 }
 
 # Snapshot for the temporal-order QC, taken BEFORE any strict-order/lag/prospective
@@ -773,14 +845,40 @@ if (identical(opt$analysis_mode, "prospective")) {
   if (!"AGE_EXIT" %in% names(prs)) prs[, AGE_EXIT := AGE_T1 + STOP]  # reconstruct if fallback scale
 
   lag_yr <- opt$incident_lag_days / 365.25
+
+  # Drop individuals with no recruitment age EXPLICITLY and FIRST. They cannot be
+  # indexed, so they have no place in a prospective analysis — but until this was
+  # added they were removed silently: is_incident became NA, timing_category became
+  # NA, and `prs[timing_category != "Historical"]` below drops NA rows without a
+  # word (data.table treats NA as FALSE in i). A recruitment file covering only
+  # part of the cohort therefore shrank the sample invisibly.
+  n_no_recruit <- sum(is.na(prs$AGE_RECRUIT))
+  if (n_no_recruit > 0) {
+    cat("  Excluding ", n_no_recruit, " of ", nrow(prs),
+        " individual(s) with no recruitment age (cannot be indexed)\n", sep="")
+    prs <- prs[!is.na(AGE_RECRUIT)]
+    record_stage(prs, "recruit_age_available")
+    if (!nrow(prs))
+      stop("No individual has a recruitment age; prospective mode cannot proceed.\n",
+           "  Check that --recruit_file uses the same IIDs as the phenotype file.")
+  }
+
   prs[, is_incident := AGE_T1 > AGE_RECRUIT]
   # timing category
   prs[, timing_category := fifelse(!is_incident & PHENO == 1 & AGE_EXIT <= AGE_RECRUIT, "Historical",
                              fifelse(!is_incident, "Prevalent_future",
                                      "Incident"))]
+  # Backstop: every row must now classify. An NA here means a new path produced a
+  # missing AGE_RECRUIT/AGE_EXIT after the exclusion above, and would again be
+  # dropped silently by the `!= "Historical"` filter.
+  if (any(is.na(prs$timing_category)))
+    stop(sum(is.na(prs$timing_category)), " row(s) have an NA timing_category after ",
+         "recruitment-age filtering; refusing to drop them silently.")
   timing_category <- prs$timing_category
   # Record the full classification (before excluding Historical) for the manuscript.
   timing_tab <- prs[, .N, by=timing_category][order(timing_category)]
+  # Never publish a blank-named category (an NA bucket used to leak into this file).
+  timing_tab <- timing_tab[!is.na(timing_category)]
   timing_console <- copy(timing_tab)   # unsuppressed, for the local console only
   # Disclosure: blank a category count below the threshold (the internal Historical
   # exclusion below keys off the prs$timing_category column, not this written table).
@@ -793,6 +891,20 @@ if (identical(opt$analysis_mode, "prospective")) {
   if (n_hist > 0) cat("  Excluding", n_hist, "Historical trajectories (T2 before recruitment)\n")
   prs <- prs[timing_category != "Historical"]
   record_stage(prs, "prospective_index_T2free")
+  # Optionally restrict T1 to incident as well. Default 'both' keeps prevalent T1
+  # (indexed at recruitment, separated by strata(T1_STATUS) + T1_DURATION), which is
+  # the long-standing behaviour and leaves every existing run unchanged.
+  if (identical(opt$prospective_t1, "incident")) {
+    n_prev <- sum(prs$timing_category == "Prevalent_future", na.rm=TRUE)
+    cat("  --prospective_t1=incident: excluding ", n_prev,
+        " Prevalent_future trajectory(ies); T1 must occur after recruitment\n", sep="")
+    prs <- prs[timing_category == "Incident"]
+    record_stage(prs, "prospective_incident_T1_only")
+    if (!nrow(prs))
+      stop("--prospective_t1=incident leaves no individuals (no incident T1 in this cohort).")
+  } else if (!identical(opt$prospective_t1, "both")) {
+    stop("--prospective_t1 must be 'both' or 'incident'; got '", opt$prospective_t1, "'.")
+  }
   # Re-index: index = recruitment (prevalent) or T1[+incident lag] (incident).
   # AGE_INDEX = current age at prediction start; T1_DURATION = time already spent
   # in the T1 state at the index (0(+lag) for incident, recruit-T1 for prevalent);
@@ -823,9 +935,26 @@ if (is.finite(opt$lag_days) && opt$lag_days > 0) {
   record_stage(prs, "lag_applied")
 }
 
-n_sameage <- sum(prs$STOP == 0, na.rm=TRUE)
-n_invalid <- sum(prs$STOP <= prs$START, na.rm=TRUE)
-cat("  Same-age T1/T2 (STOP=0, strict-order excluded): ", n_sameage, "\n", sep="")
+# Same-age T1/T2 exclusion, at survival's OWN time resolution. Two disjoint sets:
+#   n_invalid    - STOP <= START, i.e. not a strictly ordered transition;
+#   n_degenerate - ordered, but rounds to zero length under aeqSurv (float
+#                  cancellation between two ages derived from the same date).
+# Testing STOP - START rather than STOP == 0 also fixes a reporting bug: with a lag
+# sweep START = lag_yr > 0, so STOP == 0 is unreachable and the same-age count was
+# previously printed as 0 regardless of the truth.
+resolvable   <- .aeqsurv_keep(prs$START, prs$STOP)
+n_invalid    <- sum(prs$STOP <= prs$START, na.rm=TRUE)
+n_degenerate <- sum(prs$STOP > prs$START & !resolvable, na.rm=TRUE)
+n_sameage    <- n_invalid + n_degenerate
+n_sameage_events <- sum((prs$STOP <= prs$START | !resolvable) & prs$PHENO == 1, na.rm=TRUE)
+min_kept_followup <- suppressWarnings(min((prs$STOP - prs$START)[prs$STOP > prs$START & resolvable], na.rm=TRUE))
+cat("  Same-age T1/T2 (strict-order excluded): ", n_sameage,
+    " (of which ", n_degenerate, " collapse only at survival's time resolution)\n", sep="")
+# The progression GWAS counted same-day T1->T2 as cases; this pipeline excludes
+# them. Report how many events that costs so the discrepancy is never invisible.
+cat("    ...of which events: ", n_sameage_events, "\n", sep="")
+cat("    smallest RETAINED follow-up (STOP - START): ",
+    if (is.finite(min_kept_followup)) format(min_kept_followup) else "n/a", "\n", sep="")
 cat("  Removing rows with STOP <= START: ", n_invalid, "\n", sep="")
 # Data-quality flag: integer ages collapse sub-year transitions to STOP=0 and drop
 # them, which can be substantial for acute transitions (MI->HF, AF->pacemaker).
@@ -839,7 +968,7 @@ if (exists("AGE_T1_AVAILABLE") && isTRUE(AGE_T1_AVAILABLE) && "AGE_T1" %in% name
         " same-age transitions were dropped. Integer ages collapse sub-year T1->T2\n",
         "    intervals (e.g. MI->HF); use fractional ages or dates matching the GWAS temporal rule.\n", sep="")
 }
-prs <- prs[STOP > START]
+prs <- prs[STOP > START & resolvable]
 prs[, FOLLOWUP := STOP - START]
 
 # Post-recode integrity checks (harmonised analysis must not proceed on malformed
@@ -1173,7 +1302,25 @@ n_events_final <- n_events_total
 if (length(unique(prs$PHENO)) < 2)
   stop("Event status has no variation after QC (all ", unique(prs$PHENO)[1],
        "); nothing is estimable.")
-if (nrow(prs) < 50 || n_events_total < 10) stop("Insufficient data after QC")
+# Hard estimability floors, deliberately INDEPENDENT of --min_events_total (which
+# is a scientific reliability threshold checked just below, and can be lowered).
+# These fire first, so they must say what happened — a bare "Insufficient data
+# after QC" gives no way to tell a small cohort from a QC step that ate the sample.
+if (nrow(prs) < 50 || n_events_total < 10) {
+  # trajectory_attrition.csv is only written at the very end of a successful run,
+  # so it does not exist yet — render the cohort flow inline instead. Without it
+  # there is no way to tell a genuinely small cohort from a QC step that ate the
+  # sample (e.g. partial recruitment-age coverage in prospective mode).
+  flow <- tryCatch(paste(utils::capture.output(print(data.table::rbindlist(attrition_log))),
+                         collapse = "\n"),
+                   error = function(e) "  (attrition log unavailable)")
+  stop(sprintf(paste0(
+    "Insufficient data after QC: N = %d, T2 events = %d.\n",
+    "  Hard floors are N >= 50 and events >= 10. They are NOT controlled by\n",
+    "  --min_events_total (currently %d), so lowering that flag will not bypass them.\n",
+    "  Cohort flow up to this point:\n%s"),
+    nrow(prs), n_events_total, opt$min_events_total, flow))
+}
 # Cheap PRE-check only. The authoritative min-events guard runs AFTER three-PRS
 # alignment (the aligned event count is what governs estimability), and the
 # events-per-parameter warning uses the ACTUAL fitted parameter count (see below,
@@ -1803,6 +1950,23 @@ cat("✓ Quantile creation completed\n\n")
 # ==============================================================================
 cat("==============================================================================\nFITTING MODELS\n==============================================================================\n\n")
 surv_response <- "Surv(START, STOP, PHENO)"
+
+# Final guarantee on the ACTUAL analysis sample. The float-safe exclusion applied
+# earlier is not sufficient on its own: the core complete-case filter and the
+# three-PRS alignment both remove rows AFTER it, and aeqSurv's second criterion
+# divides by mean(abs(times)) — which shifts as rows leave. So re-ask aeqSurv here,
+# where DT is finally fixed and every core model below fits on it.
+{
+  .n_before_aeq <- nrow(DT)
+  DT <- .drop_degenerate_intervals(DT, "core M0-M7 sample")
+  if (nrow(DT) < .n_before_aeq) {
+    # n_events_final was computed during PRS alignment and is consumed downstream
+    # (EPV report, core-sample QC row); recompute or those figures go stale.
+    n_events_final <- sum(DT$PHENO == 1)
+    record_stage(DT, "aeqsurv_resolvable")
+  }
+}
+
 fitted_models <- list(); model_stats <- list()
 has_clinical <- length(clinical_covs) > 0
 # The standalone legacy Clinical/Full models (Model 3/4) are superseded by the
@@ -1931,6 +2095,11 @@ if (multi_prs_active && !is.null(model_specs) && length(model_specs) > 0) {
     # the ladder must apply the restriction here instead.
     clin_present <- intersect(clinical_covs, names(DT))
     DT_clinical <- if (length(clin_present)) DT[complete.cases(DT[, ..clin_present])] else DT
+    # DT_clinical is a strict subset of DT, so it has its own time set and its own
+    # mean(abs(times)) — the guarantee applied to DT does not carry over. Without
+    # this the clinical fits below, which are tryCatch-wrapped, would turn an
+    # aeqSurv collapse into a silently skipped model rather than a loud failure.
+    DT_clinical <- .drop_degenerate_intervals(DT_clinical, "clinical ladder sample")
     n_clin_dropped <- nrow(DT) - nrow(DT_clinical)
     cat("  Clinical sample: N=", nrow(DT_clinical), " events=", sum(DT_clinical$PHENO),
         " (", n_clin_dropped, " of ", nrow(DT), " core rows dropped for missing clinical covariates)\n", sep="")
@@ -2559,6 +2728,12 @@ cat("✓ Saved trajectory_summary.csv\n")
       N_prevalent_future  = sum(a1 <= ar & !(ev & a2 <= ar), na.rm=TRUE),
       N_incident          = sum(a1 >  ar, na.rm=TRUE)
     )]
+    # Recruitment-age coverage of the ORIGINAL merge. Every count above is
+    # conditional on having a recruitment age, so without this the table looks
+    # complete even when the recruitment file covered a small minority. A percentage
+    # is not a cell count, so it carries no disclosure risk.
+    if (exists("recruit_coverage_pct"))
+      qc[, `:=`(recruit_coverage_pct = round(recruit_coverage_pct, 2))]
   }
   # Disclosure: the interval bins are an EXHAUSTIVE partition that sums to the
   # retained event total, and the recruit bins likewise — so a single hidden bin is

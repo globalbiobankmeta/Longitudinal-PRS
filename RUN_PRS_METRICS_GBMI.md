@@ -265,6 +265,28 @@ The `--time-exit` column must already contain elapsed time from T1 to T2 or cens
 - Recode sex to numeric 0/1.
 - Covariate names must match the names supplied to `--covariates`.
 
+**Same-age T1/T2 transitions are excluded.** A person contributes only if T2 occurs
+*strictly after* T1, so anyone whose follow-up is zero is dropped. Note that this test is
+applied at the time resolution the survival model can actually represent: when T1 and T2
+ages are both derived from the *same date*, floating-point subtraction can leave a
+difference of ~1e-13 years (microseconds) rather than exactly 0, and those rows are
+excluded too. Genuinely short transitions are unaffected — a one-day interval is roughly
+0.0027 years, some nine orders of magnitude above the threshold.
+
+Stage 01 prints the counts, and you should read them:
+
+```text
+Same-age T1/T2 (strict-order excluded): 2 (of which 2 collapse only at survival's time resolution)
+  ...of which events: 0
+  smallest RETAINED follow-up (STOP - START): 0.002737851
+```
+
+The `...of which events` line matters for GWAS comparability: the progression GWAS counted
+same-day T1→T2 as **cases**, whereas this pipeline excludes them. If that number is large
+for your cohort, report it to the coordinating team — it quantifies a real definitional
+difference between the GWAS and these metrics, not a data error. A large count usually
+means integer-valued ages (see the `INTEGER-VALUED` warning stage 01 emits).
+
 Example:
 
 ```text
@@ -302,6 +324,33 @@ It should contain:
 
 - `IID`
 - age at recruitment or consent
+
+**It must cover the individuals in your phenotype file.** This is the single most common
+cause of a Layer 2 run that aborts or silently shrinks. The join is on `IID`; anyone
+present in the phenotype file but absent from the recruitment file has no prospective
+index and is **excluded from Layer 2** (they are unaffected in Layer 1, where recruitment
+age is descriptive only). Before running, check the overlap yourself — a recruitment file
+exported for a different release or a different ID space will match only a fraction:
+
+```bash
+# how many phenotype IIDs have a recruitment age?
+awk 'NR>1{print $1}' "$PHENO"   | sort -u > /tmp/pheno_ids
+awk 'NR>1{print $1}' "$RECRUIT" | sort -u > /tmp/recruit_ids
+comm -12 /tmp/pheno_ids /tmp/recruit_ids | wc -l   # compare with: wc -l < /tmp/pheno_ids
+```
+
+Stage 01 also reports it, in both layers, and publishes it as `recruit_coverage_pct` in
+`final_analysis_timing_qc.csv`:
+
+```text
+Recruitment-age coverage: 1125 of 20736 (5.4%)
+⚠ 19611 individual(s) have NO recruitment age.
+  In prospective mode these CANNOT be indexed and are excluded below.
+```
+
+Anything below ~90% should be investigated before you trust or share the Layer 2 result:
+the analysis is then describing a subset of your cohort, selected by which individuals
+happen to appear in the recruitment file.
 
 Example:
 
@@ -479,6 +528,17 @@ LAYER2_LAG_DAYS="0"
 # Keep 0 for the primary prospective analysis.
 INCIDENT_LAG_DAYS="0"
 
+# Which T1 states enter Layer 2. KEEP "both" for the primary prospective analysis.
+#   both     - (default) prevalent T1 (T1 before recruitment) is kept alongside incident
+#              T1. Prevalent people are indexed at recruitment, and the two groups get
+#              separate baseline hazards via strata(T1_STATUS) plus a T1-duration term.
+#              Only the OUTCOME (T2) is required to be incident.
+#   incident - additionally require T1 itself to occur after recruitment. One clean
+#              time-since-T1 clock and no prevalent-case duration adjustment, at the cost
+#              of the prevalent sample — often the majority of the cohort.
+# Use "incident" only as a sensitivity analysis, and report it as such.
+PROSPECTIVE_T1="both"
+
 # ------------------------------------------------------------------
 # Evaluation and disclosure settings [keep as default]
 # ------------------------------------------------------------------
@@ -607,6 +667,7 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" \
   --recruit-age-col="$RECRUIT_AGE_COL" \
   --lag-days="$LAYER2_LAG_DAYS" \
   --incident-lag-days="$INCIDENT_LAG_DAYS" \
+  --prospective-t1="$PROSPECTIVE_T1" \
   --prs-method="$PRS_METHOD" \
   --discovery-ancestry="$DISCOVERY_ANCESTRY" \
   --time-points="$TIME_POINTS" \
@@ -635,6 +696,9 @@ Before sharing results, confirm:
 - the `final/` folder exists;
 - no error is reported in the job output;
 - the requested Layer 1 lag analyses completed;
+- for Layer 2, `recruit_coverage_pct` in `final_analysis_timing_qc.csv` is high (§4.4) —
+  a low value means the results describe only the individuals who had a recruitment age;
+- the same-age exclusion counts in the stage-01 log are as expected for your data (§4.2);
 - the local disclosure review approves the contents of `final/`.
 
 When a job fails, keep its output directory and scheduler/job log for troubleshooting. Do not send phenotype or individual-level files by email.
@@ -703,12 +767,15 @@ The `final/` folder contains the aggregate outputs and run information needed by
 | Missing PRS score column | Check `PRS_SCORE_COL` |
 | Missing covariate | Confirm the column exists and is listed correctly in `COVARIATES` |
 | Time-definition error | Set exactly one of `AGE_EXIT_COL` or `TIME_EXIT_COL` |
+| `Insufficient data after QC: N = ..., T2 events = ...` | The message prints the cohort-flow table directly beneath it. Read down the `N_remaining` column and find the step that lost the rows — that is the cause, not the sample size itself. `recruit_age_available` dropping sharply means partial recruitment-age coverage (§4.4); `valid_timing` means the strict-order/timing filters; `complete_covariates` means missing covariates |
 | Too few events | Notify the coordinating team that the trajectory cannot be analyzed |
-| Many people are dropped | Check overlap among the three PRS files and the phenotype file |
-| Layer 2 fails | Confirm `RECRUIT` and `RECRUIT_AGE_COL` |
+| Many people are dropped | Check overlap among the three PRS files and the phenotype file, then check `Recruitment-age coverage` in the stage-01 log (§4.4) |
+| Layer 2 fails | Confirm `RECRUIT` and `RECRUIT_AGE_COL`, then check the `Recruitment-age coverage` line — a recruitment file that covers only part of the phenotype file silently reduces Layer 2 to that subset (§4.4) |
+| Many rows excluded as same-age T1/T2 | Expected when ages are integer-valued: sub-year T1→T2 intervals collapse to zero and cannot enter a survival model. Use fractional ages derived from dates. See §4.2 for how this differs from the progression GWAS, which counted same-day transitions as cases |
+| A stage fails with no message | Fixed: the driver now prints the last 40 lines of the failing stage's log and its full path. If you see only `ERROR: stage NN failed`, the stage died before opening a log — check the arguments passed to it |
 | Layer 2 stops with `predictCox ... 'NA'` after fitting | A model covariate is constant — usually `T1_DURATION`, because the sample is all-*incident* (recruitment age set to the register/birth start, so every T1 is "after recruitment"). Set `--recruit-age-col` to the biobank sample/enrollment age (§4.4). The pipeline now also drops the constant term automatically. |
 | Path with spaces fails | Quote all paths; when needed, move the pipeline to a path without special characters |
-| `RUN COMPLETE: no` | Keep the job output and contact the coordinating team |
+| `RUN COMPLETE: NO` | Keep the job output and contact the coordinating team |
 
 ---
 
