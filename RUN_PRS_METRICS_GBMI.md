@@ -36,6 +36,7 @@ The pipeline uses three PRS:
   - [6.2 Layer 2: prospective validation](#section-6-2)
 - [7. Confirm the run succeeded](#section-7)
 - [8. What to share](#section-8)
+  - [8.1 Consolidating results into a single export](#section-8-1)
 - [9. Troubleshooting](#section-9)
 - [10. Important interpretation note](#section-10)
 
@@ -752,6 +753,42 @@ Do not share:
 - local scheduler or analysis logs unless specifically requested for troubleshooting
 
 The `final/` folder contains the aggregate outputs and run information needed by the coordinating team.
+
+<a id="section-8-1"></a>
+
+## 8.1 Consolidating results into a single export (optional)
+
+If your environment reviews every exported file by hand (e.g. a FinnGen-style sandbox), bundle
+all of a site's shareable outputs into **one** file with `consolidate_results.sh`, so you make a
+single export request instead of shepherding hundreds of CSVs through review. It reads **only**
+the `final/` directories under a results root — never `intermediate/` — and refuses to write if
+any table still carries a per-individual ID column.
+
+Point `--results-root` at the top-level folder that holds all your run output directories (it
+finds every `final/` at any depth, so all trajectories × both layers collapse into one file):
+
+```bash
+# one compressed archive of every run's final/ outputs
+bash "$SCRIPT_DIR/consolidate_results.sh" --results-root=/path/to/results --cohort="$COHORT"
+#   -> /path/to/results/consolidated_prs_results_<COHORT>.tar.gz   (export just this one file)
+
+# if the sandbox only allows plain-text exports, produce one readable .txt instead:
+bash "$SCRIPT_DIR/consolidate_results.sh" --results-root=/path/to/results --cohort="$COHORT" --format=text
+```
+
+The artifact carries a `README.txt` and a `MANIFEST.tsv` (per-table sha256, size, row count)
+inside it. Figures (`.png`) are excluded by default; add `--include-figures` to keep them.
+
+The coordinating team unpacks and integrity-checks the download with `extract_results.sh`, which
+auto-detects either format, restores the `<trajectory>/<ancestry>/<method>/<layer>/` tree, and
+verifies every table against the manifest:
+
+```bash
+bash "$SCRIPT_DIR/extract_results.sh" --input=consolidated_prs_results_<COHORT>.tar.gz
+#   -> consolidated_prs_results_<COHORT>_extracted/ ...   (reports "N OK, 0 mismatched, 0 missing")
+```
+
+Run `--help` on either script for all options.
 
 ---
 
