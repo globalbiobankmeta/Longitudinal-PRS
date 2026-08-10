@@ -1407,7 +1407,8 @@ if (is_prospective) {
 extra_terms <- character(0)
 strata_term <- character(0)
 spline_or_linear <- function(col, label) {
-  nd <- length(unique(DT[[col]][is.finite(DT[[col]])]))
+  x  <- DT[[col]][is.finite(DT[[col]])]
+  nd <- length(unique(x))
   if (nd < 2) {
     # Constant covariate: unestimable. Entering it yields an NA coefficient that
     # later breaks riskRegression's predictCox ("parameters ... have no value 'NA'").
@@ -1417,12 +1418,26 @@ spline_or_linear <- function(col, label) {
         label, ")\n", sep="")
     return(character(0))
   }
+  # Use a spline only if ns() can actually build its basis on this covariate. >=4 distinct
+  # values is necessary but NOT sufficient: a heavily tied / zero-inflated covariate collapses
+  # ns()'s quantile knots onto the boundary -> "all interior knots match left boundary knot".
+  # This bites T1_DURATION whenever most of the sample is incident (T1_DURATION = 0 for every
+  # incident person, so a majority-incident prospective cohort is >2/3 zeros). Building the
+  # basis here mirrors exactly what coxph will do; fall back ONLY on a genuine ns() error, so a
+  # covariate whose spline already worked keeps the identical term (finished runs unchanged).
+  spline_ok <- FALSE
   if (opt$age_spline_df > 0 && nd >= 4) {
+    spline_ok <- tryCatch({ splines::ns(x, df = opt$age_spline_df); TRUE },
+                          error = function(e) FALSE)
+  }
+  if (spline_ok) {
     t <- sprintf("ns(%s, df=%d)", col, opt$age_spline_df)
     cat("  Covariate: ", t, " (", label, ")\n", sep=""); t
   } else {
-    if (opt$age_spline_df > 0) cat("  Covariate: ", col, " entered linearly (only ", nd, " distinct)\n", sep="")
-    else cat("  Covariate: ", col, " entered linearly (--age_spline_df 0)\n", sep=""); col
+    reason <- if (opt$age_spline_df <= 0) "--age_spline_df 0"
+              else if (nd < 4) sprintf("only %d distinct", nd)
+              else "spline knots collapse on a heavily tied / zero-inflated covariate"
+    cat("  Covariate: ", col, " entered linearly (", reason, ")\n", sep=""); col
   }
 }
 if (is_prospective) {

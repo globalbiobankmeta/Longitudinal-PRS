@@ -61,6 +61,12 @@ write.table(pheno, file.path(d, "pheno.txt"), sep = "\t", row.names = FALSE, quo
 recruitAge <- diagAge + runif(N, -8, 8)
 write.table(data.frame(IID = iid, AgeOfConsent = round(recruitAge, 3)),
             file.path(d, "recruit.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+# Majority-incident recruitment: ~80% have T1 AFTER recruitment (T1_DURATION = 0), the
+# rest prevalent. >2/3 zeros makes ns(T1_DURATION, df=3) collapse its quantile knots, which
+# used to crash Layer 2 ("all interior knots match left boundary knot"). Regression scenario.
+recruitAge_hi <- diagAge + ifelse(runif(N) < 0.8, -runif(N, 0.5, 8), runif(N, 0.5, 8))
+write.table(data.frame(IID = iid, AgeOfConsent = round(recruitAge_hi, 3)),
+            file.path(d, "recruit_hi.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
 cat("Synthetic events:", sum(event), "of", N, "\n")
 GEN
 pass "generated synthetic data"
@@ -87,6 +93,16 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" "${COMMON[@]}" --out-dir="$OUT2" \
   > "$WORK/l2.log" 2>&1 || { tail -30 "$WORK/l2.log"; fail "Layer 2 run exited non-zero"; }
 grep -q "RUN COMPLETE: yes" "$WORK/l2.log" || { tail -20 "$WORK/l2.log"; fail "Layer 2 not RUN COMPLETE"; }
 pass "Layer 2 RUN COMPLETE: yes"
+
+# ---- 3b. Layer 2, majority-incident cohort (T1_DURATION spline-collapse regression) ---
+echo "Running Layer 2 (majority-incident: T1_DURATION spline collapse)…"
+OUT2HI="$WORK/prospective_hi"
+bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" "${COMMON[@]}" --out-dir="$OUT2HI" \
+  --analysis-mode=prospective --recruit-file="$DATA/recruit_hi.txt" --lag-days=0 --run-tests=0 \
+  > "$WORK/l2hi.log" 2>&1 || { tail -30 "$WORK/l2hi.log"; fail "majority-incident Layer 2 exited non-zero (spline-collapse regression?)"; }
+grep -q "RUN COMPLETE: yes" "$WORK/l2hi.log" || { tail -20 "$WORK/l2hi.log"; fail "majority-incident Layer 2 not RUN COMPLETE"; }
+grep -q "T1_DURATION entered linearly" "$WORK/l2hi.log" || { tail -20 "$WORK/l2hi.log"; fail "expected T1_DURATION to fall back to linear on a majority-incident cohort"; }
+pass "majority-incident Layer 2 RUN COMPLETE; T1_DURATION fell back to linear (no ns() crash)"
 
 # ---- 4. Assertions on the Layer-1 final/ ------------------------------------
 FINAL="$OUT1/final"; PFX="SMOKE_EUR_PRScs_SYN_to_TEST"

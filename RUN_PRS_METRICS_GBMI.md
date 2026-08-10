@@ -774,6 +774,7 @@ The `final/` folder contains the aggregate outputs and run information needed by
 | Many rows excluded as same-age T1/T2 | Expected when ages are integer-valued: sub-year T1→T2 intervals collapse to zero and cannot enter a survival model. Use fractional ages derived from dates. See §4.2 for how this differs from the progression GWAS, which counted same-day transitions as cases |
 | A stage fails with no message | Fixed: the driver now prints the last 40 lines of the failing stage's log and its full path. If you see only `ERROR: stage NN failed`, the stage died before opening a log — check the arguments passed to it |
 | Layer 2 stops with `predictCox ... 'NA'` after fitting | A model covariate is constant — usually `T1_DURATION`, because the sample is all-*incident* (recruitment age set to the register/birth start, so every T1 is "after recruitment"). Set `--recruit-age-col` to the biobank sample/enrollment age (§4.4). The pipeline now also drops the constant term automatically. |
+| Layer 2 stops with `Error in ns(T1_DURATION, df = 3) : all interior knots match left boundary knot` | Most of the sample is *incident*, so `T1_DURATION` (time in the T1 state at the index) is 0 for the majority and its spline knots collapse. Not a data error — the pipeline now enters `T1_DURATION` linearly automatically when the spline is not estimable, and the run completes. |
 | Path with spaces fails | Quote all paths; when needed, move the pipeline to a path without special characters |
 | `RUN COMPLETE: NO` | Keep the job output and contact the coordinating team |
 
