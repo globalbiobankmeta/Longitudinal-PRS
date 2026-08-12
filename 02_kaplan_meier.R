@@ -1121,13 +1121,18 @@ for (q_name in quantiles_to_analyze) {
     ref_lab <- if (!is.null(qo) && !is.null(qo$reference)) as.character(qo$reference) else NULL
     rmst_result <- calculate_rmst(DT, timeCol, statusCol, quant_col, tau = rmst_tau, n_boot = n_boot,
                                   reference_label = ref_lab)
-    rmst_result[, quantile := q_name]
-    all_rmst[[q_name]] <- rmst_result
-    
-    print(rmst_result[, .(group, tau, rmst, rmst_lcl, rmst_ucl)])
-    if ("rmst_diff" %in% names(rmst_result)) {
-      cat("  RMST differences vs reference:\n")
-      print(rmst_result[, .(group, tau, rmst_diff, rmst_diff_lcl, rmst_diff_ucl, rmst_diff_pval)])
+    # calculate_rmst() returns an EMPTY data.table when no tau has adequate follow-up in
+    # every group (e.g. a 1% tail group with < 10 at risk, common when N is small). Guard
+    # the store/print: printing rmst_result[, .(group, ...)] on the columnless table would
+    # crash the whole stage with "object 'group' not found". The reason was already logged.
+    if (nrow(rmst_result) > 0 && "group" %in% names(rmst_result)) {
+      rmst_result[, quantile := q_name]
+      all_rmst[[q_name]] <- rmst_result
+      print(rmst_result[, .(group, tau, rmst, rmst_lcl, rmst_ucl)])
+      if ("rmst_diff" %in% names(rmst_result)) {
+        cat("  RMST differences vs reference:\n")
+        print(rmst_result[, .(group, tau, rmst_diff, rmst_diff_lcl, rmst_diff_ucl, rmst_diff_pval)])
+      }
     }
   }
   
