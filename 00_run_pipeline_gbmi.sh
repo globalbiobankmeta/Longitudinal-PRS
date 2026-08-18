@@ -97,6 +97,7 @@ PROGRESSION_PRS_FILE_OVERRIDE=""
 # Optional explicit model spec — if set, overrides auto-combination
 # Format: "Name=Label1+Label2;Name2=Label3"
 MODELS_SPEC="${MODELS_SPEC:-}"
+PRS_SIGNS="${PRS_SIGNS:-}"       # prespecified per-PRS +1/-1 multipliers, onset,progression,outcome order (-1 flips)
 
 # Stage toggles (1=run, 0=skip)
 RUN_01="${RUN_01:-1}"
@@ -167,6 +168,14 @@ Downstream model / display selection:
   --score-role=STR          Which PRS drives 02/06 displays: all (default) | onset | outcome |
                             progression (comma-separated subset allowed)
   --role-quantiles=CSV      Quantile schemes per role (default: Q5,Q10; 'all' for every scheme)
+  --prs-signs=CSV           Prespecified per-PRS direction multipliers, +1/-1, comma-separated in
+                            ONSET,PROGRESSION,OUTCOME order. -1 flips that score, +1 keeps it. For a
+                            score with a known reversed allele/sign convention: re-run with this to
+                            harmonise direction — it flips the HR AND the Top/Bottom quantiles
+                            together (LRT/c-index/AUC/calibration unchanged). Examples:
+                            --prs-signs=-1,-1,-1 flips all three; --prs-signs=1,-1,1 flips only
+                            progression. (Outcome-based auto-flip is not offered — it is
+                            target-outcome leakage; stage 01 flags a negatively-oriented score.)
   --enable-clinical-utility Emit net benefit / PAF / NNS / lifetime risk from stage 06.
                             These are APPARENT (same-sample) estimates; off by default.
   --no-rmst                 Skip restricted mean progression-free time in stage 02
@@ -326,6 +335,8 @@ while (( $# )); do
 
     --models-spec=*)     MODELS_SPEC="${1#*=}" ;;
     --models-spec)       shift; MODELS_SPEC="$1" ;;
+    --prs-signs=*)       PRS_SIGNS="${1#*=}" ;;
+    --prs-signs)         shift; PRS_SIGNS="$1" ;;
 
     --time-points=*)     TIME_POINTS="${1#*=}" ;;
     --time-points)       shift; TIME_POINTS="$1" ;;
@@ -806,6 +817,11 @@ MULTI_PRS_ARGS=(
   --prs_files    "${PROGRESSION_PRS_PATH},${OUTCOME_PRS_PATH}"
 )
 [[ -n "$MODELS_SPEC" ]] && MULTI_PRS_ARGS+=(--models "$MODELS_SPEC")
+# PRS direction: prespecified per-PRS signs only (onset,progression,outcome; -1 flips).
+# Outcome-based auto-flip is NOT exposed here — it is target-outcome leakage and 01 forbids
+# it in the 3-PRS analysis. Use the =form: the value starts with '-' (e.g. -1,-1,-1), which
+# getopt would otherwise read as the next flag ("flag prs_signs requires an argument").
+[[ -n "$PRS_SIGNS" ]] && MULTI_PRS_ARGS+=("--prs_signs=$PRS_SIGNS")
 
 # Time-scale args. Always pass the age-at-T1 (spline) column and a --time_exit
 # fallback; if an age-at-exit column is given too, 01 prefers STOP = age_exit - age_t1.
@@ -868,6 +884,7 @@ if [[ "$RUN_01" == "1" ]]; then
   echo "min_cell_count,${MIN_CELL_COUNT}"
   echo "contrast_pairs,\"${CONTRAST_PAIRS}\""
   echo "score_roles,\"${SCORE_ROLE}\""
+  echo "prs_signs,\"${PRS_SIGNS}\""
   echo "calculate_rmst,${CALC_RMST}"
   echo "calculate_uno,${CALC_UNO}"
   echo "stages,\"01=${RUN_01} 02=${RUN_02} 03=${RUN_03} 04=${RUN_04} 05=${RUN_05} 06=${RUN_06}\""

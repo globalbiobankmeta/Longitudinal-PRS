@@ -215,6 +215,32 @@ For PRS calculation and chromosome merging, see:
 <strong>Note:</strong> To ensure compatibility with the pipeline, please use the following naming conventions for PRS outputs: <code>T1</code> for onset PRS, <code>T1toT2</code> or <code>T1_to_T2</code> for progression PRS, and <code>T2</code> for outcome PRS. Please refer to the <a href="https://github.com/globalbiobankmeta/Longitudinal-PRS/blob/main/gbmi_trajectory_biobank_gwas_names.tsv">trajectory definition file</a> for the complete trajectory definitions for each biobank.
 </span>
 
+**PRS direction (check the sign).** A correctly aligned PRS is **positively** associated with its
+outcome. The pipeline reports each score's coefficient sign (`all_coefficients.csv`,
+`model_comparison.csv`) and stage 01 prints a loud warning if a PRS's *adjusted* association with the
+outcome is **significantly negative** (a reverse-orientation signal; a truly-null score stays quiet).
+If your biobank's score is reverse-oriented — a known allele/strand/sign-convention
+difference, confirmed against the discovery GWAS / other biobanks and **not** this sample's outcome
+— correct it by setting **`PRS_SIGNS`** in the [Section 5](#section-5) config block (it is passed to
+both Layer 1 and Layer 2 as `--prs-signs`) and re-running:
+
+- `PRS_SIGNS` / `--prs-signs` takes three comma-separated multipliers, `+1` or `-1`, in **onset,
+  progression, outcome** order. **`-1` flips that score; `+1` keeps it.** Leave it empty for a
+  correctly-oriented score (the normal case).
+- `--prs-signs=-1,-1,-1` — flips all three (the usual case: a whole-biobank reversed convention).
+- `--prs-signs=1,-1,1` — flips only progression; `--prs-signs=-1,1,1` — flips only onset.
+
+This flips the score **before quantile binning** (and equivalently orients the standardised score), so the HR direction **and**
+the Top/Bottom quantile groups reorient together and consistently.
+
+Do **not** just flip the HR in the final report: the quantile-keyed outputs (Top1%/Bottom1% risk
+tables, KM curves, absolute risks, percentile survival, RMST by group) are built from the score's
+orientation and would be left mislabelled. And do **not** choose the sign because the score is
+negatively correlated with the outcome *in your sample* — that is target-outcome leakage; direction
+must be prespecified from allele harmonisation. Re-running with the flip leaves the LRT p-values,
+c-index/AUC, calibration and per-individual absolute risks **unchanged** — only the sign and the
+quantile orientation change.
+
 <a id="section-4-2"></a>
 
 ## 4.2 Progression phenotype file
@@ -469,6 +495,13 @@ RECRUIT="/path/to/recruit/recruit.txt" #note to update as empty when there is no
 # unrelated set and/or one target ancestry. See section 4.5. Leave empty to use the whole input.
 POP_FILE="" 
 
+# PRS direction (§4.1). Leave EMPTY for correctly-oriented scores (the normal case). Only set this
+# if the coordinating team tells you your biobank's score is reverse-coded: three +1/-1 values in
+# ONSET,PROGRESSION,OUTCOME order, where -1 flips that score. e.g. "-1,-1,-1" flips all three,
+# "1,-1,1" flips only progression. This is a PRESPECIFIED correction — do NOT set it from your own
+# sample's PRS–outcome correlation (leakage).
+PRS_SIGNS=""
+
 # ------------------------------------------------------------------------------
 # Input column names [update to reflect the names used in your biobank]
 # ------------------------------------------------------------------------------
@@ -567,6 +600,11 @@ if [[ -n "$POP_FILE" ]]; then
   POP_FILE_ARGS=(--pop-file="$POP_FILE")
 fi
 
+PRS_SIGNS_ARGS=()
+if [[ -n "$PRS_SIGNS" ]]; then
+  PRS_SIGNS_ARGS=(--prs-signs="$PRS_SIGNS")
+fi
+
 LAYER1_RECRUIT_ARGS=()
 if [[ -n "$RECRUIT" ]]; then
   LAYER1_RECRUIT_ARGS=(
@@ -606,6 +644,7 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" \
   --pheno-file="$PHENO" \
   ${COV_FILE_ARGS[@]+"${COV_FILE_ARGS[@]}"} \
   ${POP_FILE_ARGS[@]+"${POP_FILE_ARGS[@]}"} \
+  ${PRS_SIGNS_ARGS[@]+"${PRS_SIGNS_ARGS[@]}"} \
   --cohort="$COHORT" \
   --ancestry="$ANCESTRY" \
   --status-col="$STATUS_COL" \
@@ -656,6 +695,7 @@ bash "$SCRIPT_DIR/00_run_pipeline_gbmi.sh" \
   --pheno-file="$PHENO" \
   ${COV_FILE_ARGS[@]+"${COV_FILE_ARGS[@]}"} \
   ${POP_FILE_ARGS[@]+"${POP_FILE_ARGS[@]}"} \
+  ${PRS_SIGNS_ARGS[@]+"${PRS_SIGNS_ARGS[@]}"} \
   --cohort="$COHORT" \
   --ancestry="$ANCESTRY" \
   --status-col="$STATUS_COL" \
@@ -813,6 +853,7 @@ Run `--help` on either script for all options.
 | Layer 2 stops with `predictCox ... 'NA'` after fitting | A model covariate is constant — usually `T1_DURATION`, because the sample is all-*incident* (recruitment age set to the register/birth start, so every T1 is "after recruitment"). Set `--recruit-age-col` to the biobank sample/enrollment age (§4.4). The pipeline now also drops the constant term automatically. |
 | Layer 2 stops with `Error in ns(T1_DURATION, df = 3) : all interior knots match left boundary knot` | Most of the sample is *incident*, so `T1_DURATION` (time in the T1 state at the index) is 0 for the majority and its spline knots collapse. Not a data error — the pipeline now enters `T1_DURATION` linearly automatically when the spline is not estimable, and the run completes. |
 | Path with spaces fails | Quote all paths; when needed, move the pipeline to a path without special characters |
+| A PRS looks protective (HR<1) / stage 01 warns of a **significantly negative adjusted association with the outcome** | The score is reverse-oriented for this biobank. Re-run with a **prespecified** sign via `--prs-signs` (three `+1`/`-1` values in onset,progression,outcome order; `-1` flips). All three reversed → `--prs-signs=-1,-1,-1`; only one → e.g. `--prs-signs=1,-1,1`. It reorients the HR and the Top/Bottom quantiles together; LRT/c-index/AUC/calibration are unchanged. Do **not** post-hoc flip only the HR, and do **not** flip based on the in-sample outcome correlation (leakage). See §4.1. |
 | `RUN COMPLETE: NO` | Keep the job output and contact the coordinating team |
 
 ---

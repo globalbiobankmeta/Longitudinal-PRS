@@ -135,10 +135,8 @@ option_list <- list(
               help="Sex coding: value=label pairs [default: 0=Female,1=Male]"),
   
   # PRS processing
-  make_option("--flip_prs", action="store_true", default=FALSE,
-              help="Manually flip the PRIMARY PRS direction (prespecified) [default: FALSE]"),
   make_option("--prs_signs", type="character", default=NULL,
-              help="Explicit prespecified direction multipliers (+1/-1), comma-separated in --prs_labels order. E.g. '1,1,1'. Preferred over --flip_prs for multi-PRS."),
+              help="Prespecified per-PRS direction multipliers +1/-1, comma-separated in --prs_labels (onset,progression,outcome) order. -1 = flip that score, +1 = keep. E.g. '-1,-1,-1' flips all three; '1,-1,1' flips only progression. Use for a score with a known reversed allele/sign convention."),
   make_option("--auto_flip_prs", action="store_true", default=FALSE,
               help="DISCOURAGED: auto-flip a PRS if it is negatively correlated with the OUTCOME in the target cohort. This is target-outcome dependent; direction should come from discovery-stage allele harmonisation. [default: FALSE]"),
   make_option("--zscore_by_controls", action="store_true", default=FALSE,
@@ -292,8 +290,8 @@ opt$analysis_mode <- tryCatch(match.arg(opt$analysis_mode, c("gwas_aligned", "pr
                               error = function(e) stop("--analysis_mode must be 'gwas_aligned' or 'prospective' (got '", opt$analysis_mode, "')"))
 
 # PRS direction options must not conflict (a score could otherwise be flipped twice).
-if (!is.null(opt$prs_signs) && nzchar(opt$prs_signs) && (isTRUE(opt$flip_prs) || isTRUE(opt$auto_flip_prs)))
-  stop("--prs_signs cannot be combined with --flip_prs or --auto_flip_prs (double-flip risk). ",
+if (!is.null(opt$prs_signs) && nzchar(opt$prs_signs) && isTRUE(opt$auto_flip_prs))
+  stop("--prs_signs cannot be combined with --auto_flip_prs (double-flip risk). ",
        "Use exactly one direction mechanism.")
 
 # ==============================================================================
@@ -1338,19 +1336,13 @@ if (n_events_total < opt$min_events_total) {
 # ==============================================================================
 # Direction must come from discovery-stage allele harmonisation, NOT from whether
 # the score predicts the outcome positively in this cohort. Default: no flipping.
-#   --flip_prs    : explicit, prespecified flip of the PRIMARY score
-#   --prs_signs   : explicit per-PRS multipliers (handled in multi-PRS block)
+#   --prs_signs   : explicit prespecified per-PRS multipliers +1/-1 (handled in the
+#                   multi-PRS block below; -1 flips that score, order onset,progression,outcome)
 #   --auto_flip_prs (default FALSE, DISCOURAGED): outcome-dependent auto-flip
 prs_pheno_cor_raw <- cor(prs$SCORESUM, prs$PHENO, use="complete.obs")
 prs_pheno_cor <- prs_pheno_cor_raw
 prs_direction <- "as_supplied"
 
-if (isTRUE(opt$flip_prs)) {
-  prs[, SCORESUM := -SCORESUM]
-  prs_pheno_cor <- cor(prs$SCORESUM, prs$PHENO)
-  prs_direction <- "manual_flip"
-  cat("✓ Primary PRS direction flipped manually (--flip_prs)\n")
-}
 if (isTRUE(opt$auto_flip_prs) && prs_pheno_cor < 0) {
   warning("--auto_flip_prs is target-outcome dependent (leakage). ",
           "Direction should come from discovery-stage harmonisation. Flipping anyway as requested.")
@@ -1620,6 +1612,9 @@ if (multi_prs_active) {
     cat("  ✓ Re-standardised all PRS on the aligned sample (mean 0, SD 1)\n")
     if (length(prs_signs_applied))
       cat("  ✓ Applied prespecified sign flip (--prs_signs) to:", paste(prs_signs_applied, collapse=", "), "\n")
+
+    # PRS orientation is checked AFTER model fitting, off each single-PRS model's
+    # adjusted coefficient (the published estimand), not the marginal correlation here.
 
     # ------------------------------------------------------------------------
     # RE-CHECK the minimum-event guard on the ALIGNED sample (the count that
@@ -2095,6 +2090,30 @@ if (multi_prs_active && !is.null(model_specs) && length(model_specs) > 0) {
   if (length(missing_core))
     stop("Required M0-M7 core models failed to fit: ", paste(missing_core, collapse=", "),
          ". The run is incomplete; do not return partial results.")
+
+  # ---------------------------------------------------------------------------
+  # PRS ORIENTATION DETECTION (advisory; never auto-flips). A correctly aligned PRS
+  # has a POSITIVE adjusted association with its outcome. Key the check off each
+  # single-PRS model's fitted coefficient (the published, covariate/age-adjusted
+  # estimand — the marginal correlation can disagree with it under confounding), and
+  # warn only when it is SIGNIFICANTLY negative, so a truly-null score (whose sign is
+  # noise) stays quiet. The fix is a PRESPECIFIED --prs_signs re-run, never an
+  # outcome-driven flip. Signs are also visible centrally in all_coefficients.csv.
+  for (role in names(prs_role_cols)) {
+    std_col <- prs_role_cols[[role]]; label <- sub("_std$", "", std_col)
+    ms <- model_stats[[label]]
+    if (is.null(ms) || is.null(ms$coefficients)) next
+    crow <- ms$coefficients[variable == std_col]
+    if (!nrow(crow)) next
+    b <- crow$coef[1]; pv <- crow$p[1]; hr <- crow$HR[1]
+    if (is.finite(b) && b < 0 && is.finite(pv) && pv < 0.05) {
+      cat(sprintf("  ⚠ WARNING: the %s PRS has a significantly NEGATIVE adjusted association with the outcome (HR/SD = %.3f, p = %.2g) after any --prs_signs.\n", role, hr, pv))
+      cat("      A correctly aligned PRS is POSITIVELY associated with its outcome. If this reflects a known\n")
+      cat("      reversed allele/sign convention for this biobank (confirm against the discovery GWAS / other\n")
+      cat("      biobanks, NOT this sample's outcome), re-run with the prespecified sign, e.g. --prs_signs=-1,...\n")
+      cat("      Do NOT flip on this in-sample association alone — that is target-outcome leakage.\n")
+    }
+  }
 
   # ---------------------------------------------------------------------------
   # CLINICAL LADDER (gated): parallel Clinical_M0..M7 = core M-model + clinical
@@ -2632,7 +2651,7 @@ metadata <- list(
   prs_info = list(
     correlation_with_pheno = prs_pheno_cor,
     correlation_with_pheno_raw = prs_pheno_cor_raw,
-    # Direction provenance: as_supplied | manual_flip | prs_signs | auto(outcome).
+    # Direction provenance: as_supplied | prs_signs | auto(outcome).
     direction = if (exists("prs_signs_applied") && length(prs_signs_applied)) "prs_signs" else prs_direction,
     prs_signs = if (exists("prs_signs_applied")) prs_signs_applied else NULL,
     zscore_method = if (isTRUE(opt$zscore_by_controls)) "controls" else "whole_sample",
